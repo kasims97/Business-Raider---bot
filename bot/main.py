@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
 from telegram.ext import Application, Defaults, MessageHandler, MessageReactionHandler, filters
 
 from bot.config import Settings
@@ -21,6 +22,7 @@ def build_application() -> Application:
         Application.builder()
         .token(settings.bot_token)
         .defaults(Defaults(tzinfo=settings.timezone))
+        .post_init(post_init)
         .build()
     )
 
@@ -42,6 +44,25 @@ def build_application() -> Application:
     )
 
     return application
+
+
+async def post_init(application: Application) -> None:
+    group_commands = [
+        BotCommand("top", "Текущий рейтинг недели"),
+        BotCommand("myrating", "Личная статистика за неделю"),
+        BotCommand("summary", "Полные итоги недели"),
+    ]
+    private_commands = [
+        BotCommand("start", "Как пользоваться ботом"),
+    ]
+    await application.bot.set_my_commands(
+        group_commands,
+        scope=BotCommandScopeAllGroupChats(),
+    )
+    await application.bot.set_my_commands(
+        private_commands,
+        scope=BotCommandScopeAllPrivateChats(),
+    )
 
 
 def main() -> None:

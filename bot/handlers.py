@@ -136,7 +136,7 @@ class BotHandlers:
         week_start = week_start_for_dt(now)
         ranked = sort_for_ranking(self.storage.get_week_stats(week_start))
         text = format_ranking(ranked, "Текущий рейтинг недели")
-        await update.effective_message.reply_text(text)
+        await update.effective_message.reply_text(text, do_quote=False)
 
     async def _send_personal(self, update: Update) -> None:
         user = update.effective_user
@@ -150,10 +150,13 @@ class BotHandlers:
             if item.user_id == user.id:
                 titles = self.storage.get_titles_for_user(week_start, user.id)
                 text = format_personal_stats(item, idx, len(ranked), titles)
-                await update.effective_message.reply_text(text)
+                await update.effective_message.reply_text(text, do_quote=False)
                 return
 
-        await update.effective_message.reply_text("За эту неделю у тебя пока нет активности.")
+        await update.effective_message.reply_text(
+            "За эту неделю у тебя пока нет активности.",
+            do_quote=False,
+        )
 
     async def _send_summary(self, update: Update) -> None:
         if update.effective_message is None:
@@ -161,7 +164,7 @@ class BotHandlers:
         now = datetime.now(self.settings.timezone)
         week_start = week_start_for_dt(now)
         text = self._build_summary_payload(week_start)
-        await update.effective_message.reply_text(text)
+        await update.effective_message.reply_text(text, do_quote=False)
 
     def _build_summary_payload(self, week_start):
         stats = self.storage.get_week_stats(week_start)
@@ -183,7 +186,8 @@ class BotHandlers:
         if text.startswith("/start"):
             await update.effective_message.reply_text(
                 "Добавь меня в групповой чат, и я сам начну считать активность. "
-                "После привязки команды /top, /топ, /мойрейтинг и /итоги работают в группе."
+                "После привязки команды /top, /топ, /мойрейтинг и /итоги работают в группе.",
+                do_quote=False,
             )
 
     def _active_chat_id(self) -> int | None:
