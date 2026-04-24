@@ -257,6 +257,35 @@ class RatingTests(unittest.TestCase):
             self.assertIn("Срез недели", text)
             self.assertEqual(storage.get_titles_for_user(week_start, 1), [])
 
+    def test_message_content_and_salute_transcript_storage(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            storage = Storage(Path(tmpdir) / "bot.sqlite3")
+            storage.init()
+            storage.upsert_user(1, "one", "One", is_bot=False)
+            storage.save_message_content(
+                chat_id=100,
+                message_id=1,
+                user_id=1,
+                message_date=date(2026, 4, 20),
+                message_type="voice",
+                text_content=None,
+                reply_to_message_id=None,
+                file_id="voice-file",
+                transcript_status="missing",
+            )
+            saved = storage.save_salute_transcript(
+                chat_id=100,
+                reply_to_message_id=1,
+                transcript_text="Привет, это расшифровка",
+            )
+            rows = storage.get_recent_message_content(chat_id=100, limit=10)
+
+            self.assertTrue(saved)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["transcript_text"], "Привет, это расшифровка")
+            self.assertEqual(rows[0]["transcript_source"], "salute")
+            self.assertEqual(rows[0]["transcript_status"], "done")
+
 
 if __name__ == "__main__":
     unittest.main()

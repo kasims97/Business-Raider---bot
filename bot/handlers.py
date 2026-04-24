@@ -9,6 +9,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, 
 from telegram.constants import ChatType
 from telegram.ext import ContextTypes
 
+from bot.ai import SummaryError, summarize_chat
 from bot.config import Settings
 from bot.rating import (
     format_personal_stats,
@@ -27,6 +28,7 @@ COMMAND_MY = re.compile(r"^/(мойрейтинг|myrating)(?:@\w+)?$")
 COMMAND_SUMMARY = re.compile(r"^/(итоги|summary)(?:@\w+)?$")
 COMMAND_ABOUT = re.compile(r"^/about(?:@\w+)?$")
 COMMAND_REP = re.compile(r"^/rep(?:@\w+)?$")
+COMMAND_CATCHUP = re.compile(r"^/catchup(?:@\w+)?$")
 COMMAND_OLD_REP = re.compile(r"^/([+-])rep(?:@\w+)?$")
 
 
@@ -65,6 +67,9 @@ class BotHandlers:
         )
         text = (message.text or "").strip()
 
+        if self._maybe_capture_salute_transcript(update):
+            return
+
         if COMMAND_TOP.match(text):
             await self._send_top(update)
             return
@@ -76,6 +81,9 @@ class BotHandlers:
             return
         if COMMAND_ABOUT.match(text):
             await self._send_about(update)
+            return
+        if COMMAND_CATCHUP.match(text):
+            await self._send_catchup(update)
             return
         if COMMAND_REP.match(text):
             await self._show_rep_user_picker(update)
@@ -97,6 +105,17 @@ class BotHandlers:
             day=now.date(),
             is_forward_public=self._is_public_forward(message),
             is_video_note=message.video_note is not None,
+        )
+        self.storage.save_message_content(
+            chat_id=chat.id,
+            message_id=message.message_id,
+            user_id=user.id,
+            message_date=now.date(),
+            message_type=self._message_type(message),
+            text_content=self._message_text_content(message),
+            reply_to_message_id=message.reply_to_message.message_id if message.reply_to_message else None,
+            file_id=self._message_file_id(message),
+            transcript_status=self._transcript_status_for_message(message),
         )
 
         mentioned_ids = self._extract_mentions(message)
@@ -237,9 +256,65 @@ class BotHandlers:
             return
         await update.effective_message.reply_text(
             "Я бот рейтинга чата. Слежу за активностью в течение недели, показываю, кто тащит движ, "
-            "а по воскресеньям публикую итоги и титулы. Через /rep можно дать участнику +rep или -rep в репутацию.",
+            "а по воскресеньям публикую итоги и титулы. Через /rep можно дать участнику +rep или -rep в репутацию. "
+            "А через /catchup можно получить краткую выжимку последних 100 сообщений.",
             do_quote=False,
         )
+
+    async def _send_catchup(self, update: Update) -> None:
+        message = update.effective_message
+        chat = update.effective_chat
+        if message is None or chat is None:
+            return
+
+        rows = self.storage.get_recent_message_content(chat_id=chat.id, limit=100)
+        if not rows:
+            await message.reply_text(
+                "Пока нечего пересказывать. Бот ещё не накопил сообщения для выжимки.",
+                do_quote=False,
+            )
+            return
+
+        status_message = await message.reply_text(
+            "Собираю краткую выжимку последних 100 сообщений...",
+            do_quote=False,
+        )
+
+        blocks: list[str] = []
+        missing_audio = 0
+        for row in rows:
+            if row["is_bot"] and row["username"] and row["username"].lower() == self.settings.salute_bot_username:
+                continue
+            block = self._message_row_to_summary_block(row)
+            if block is None:
+                if row["message_type"] in {"voice", "video_note"} and row["transcript_status"] != "done":
+                    missing_audio += 1
+                continue
+            blocks.append(block)
+
+        if not blocks:
+            await status_message.edit_text(
+                "Пока нечего пересказывать: в последних сообщениях нет доступного текста для резюме."
+            )
+            return
+
+        try:
+            summary = summarize_chat(
+                settings=self.settings,
+                transcript_blocks=blocks,
+                missing_audio_count=missing_audio,
+            )
+        except SummaryError:
+            await status_message.edit_text(
+                "Не получилось собрать резюме прямо сейчас. Попробуй ещё раз чуть позже."
+            )
+            return
+
+        if missing_audio:
+            summary = (
+                f"{summary}\n\nНе всё аудио вошло в резюме: часть голосовых и кружочков ещё без расшифровки."
+            )
+        await status_message.edit_text(summary)
 
     async def _show_rep_user_picker(self, update: Update) -> None:
         message = update.effective_message
@@ -380,7 +455,7 @@ class BotHandlers:
         if text.startswith("/start"):
             await update.effective_message.reply_text(
                 "Добавь меня в группу, и я начну вести рейтинг чата. В группе доступны команды: "
-                "/top, /myrating, /summary, /rep и /about.",
+                "/top, /myrating, /summary, /rep, /catchup и /about.",
                 do_quote=False,
             )
         elif text.startswith("/about"):
@@ -489,3 +564,82 @@ class BotHandlers:
 
     def _rep_cancel_data(self, owner_user_id: int) -> str:
         return f"rep:c:{owner_user_id}"
+
+    def _maybe_capture_salute_transcript(self, update: Update) -> bool:
+        message = update.effective_message
+        user = update.effective_user
+        chat = update.effective_chat
+        if message is None or user is None or chat is None:
+            return False
+        if not user.is_bot:
+            return False
+        if (user.username or "").lower() != self.settings.salute_bot_username:
+            return False
+        if message.reply_to_message is None:
+            return False
+
+        transcript = self._extract_salute_transcript_text(message)
+        if not transcript:
+            return False
+        saved = self.storage.save_salute_transcript(
+            chat_id=chat.id,
+            reply_to_message_id=message.reply_to_message.message_id,
+            transcript_text=transcript,
+        )
+        return saved
+
+    def _extract_salute_transcript_text(self, message) -> str | None:
+        text = (message.text or message.caption or "").strip()
+        if not text:
+            return None
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(lines) >= 3 and lines[1].lower() in {"voice message", "video note"}:
+            return " ".join(lines[2:]).strip()
+        if len(lines) >= 2 and lines[0].lower() not in {"voice message", "video note"}:
+            return " ".join(lines[1:]).strip()
+        return text
+
+    def _message_type(self, message) -> str:
+        if message.voice is not None:
+            return "voice"
+        if message.video_note is not None:
+            return "video_note"
+        if message.forward_origin is not None:
+            return "forward"
+        if message.caption:
+            return "caption"
+        if message.text:
+            return "text"
+        return "other"
+
+    def _message_text_content(self, message) -> str | None:
+        text = (message.text or message.caption or "").strip()
+        return text or None
+
+    def _message_file_id(self, message) -> str | None:
+        if message.voice is not None:
+            return message.voice.file_id
+        if message.video_note is not None:
+            return message.video_note.file_id
+        return None
+
+    def _transcript_status_for_message(self, message) -> str:
+        if message.voice is not None or message.video_note is not None:
+            return "missing"
+        return "not_needed"
+
+    def _message_row_to_summary_block(self, row) -> str | None:
+        name = f"@{row['username']}" if row["username"] else row["first_name"]
+        message_type = row["message_type"]
+        if message_type in {"voice", "video_note"}:
+            transcript = row["transcript_text"]
+            if not transcript:
+                return None
+            prefix = "[кружочек]" if message_type == "video_note" else "[голосовое]"
+            return f"{name}: {prefix} {transcript}"
+        text = (row["text_content"] or "").strip()
+        if not text:
+            return None
+        if message_type == "forward":
+            text = f"[переслано] {text}"
+        return f"{name}: {text}"

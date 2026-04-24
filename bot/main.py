@@ -60,6 +60,7 @@ async def post_init(application: Application) -> None:
         BotCommand("myrating", "твоя статистика"),
         BotCommand("summary", "промежуточные итоги недели"),
         BotCommand("rep", "дать +rep или -rep участнику"),
+        BotCommand("catchup", "краткое резюме последних 100 сообщений"),
         BotCommand("about", "что умеет бот"),
     ]
     private_commands = [

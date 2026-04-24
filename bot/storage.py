@@ -94,6 +94,21 @@ class Storage:
                     last_seen_at TEXT NOT NULL,
                     PRIMARY KEY (chat_id, user_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS message_content (
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    message_date TEXT NOT NULL,
+                    message_type TEXT NOT NULL,
+                    text_content TEXT,
+                    reply_to_message_id INTEGER,
+                    file_id TEXT,
+                    transcript_text TEXT,
+                    transcript_source TEXT NOT NULL DEFAULT 'none',
+                    transcript_status TEXT NOT NULL DEFAULT 'not_needed',
+                    PRIMARY KEY (chat_id, message_id)
+                );
                 """
             )
             columns = {
@@ -173,6 +188,98 @@ class Storage:
                 """,
                 (chat_id, message_id, user_id, day.isoformat()),
             )
+
+    def save_message_content(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        user_id: int,
+        message_date: date,
+        message_type: str,
+        text_content: str | None,
+        reply_to_message_id: int | None,
+        file_id: str | None,
+        transcript_status: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO message_content (
+                    chat_id, message_id, user_id, message_date, message_type,
+                    text_content, reply_to_message_id, file_id, transcript_status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    message_date = excluded.message_date,
+                    message_type = excluded.message_type,
+                    text_content = excluded.text_content,
+                    reply_to_message_id = excluded.reply_to_message_id,
+                    file_id = excluded.file_id,
+                    transcript_status = excluded.transcript_status
+                """,
+                (
+                    chat_id,
+                    message_id,
+                    user_id,
+                    message_date.isoformat(),
+                    message_type,
+                    text_content,
+                    reply_to_message_id,
+                    file_id,
+                    transcript_status,
+                ),
+            )
+
+    def save_salute_transcript(
+        self,
+        *,
+        chat_id: int,
+        reply_to_message_id: int,
+        transcript_text: str,
+    ) -> bool:
+        if not transcript_text.strip():
+            return False
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM message_content
+                WHERE chat_id = ?
+                  AND message_id = ?
+                  AND message_type IN ('voice', 'video_note')
+                """,
+                (chat_id, reply_to_message_id),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute(
+                """
+                UPDATE message_content
+                SET transcript_text = ?,
+                    transcript_source = 'salute',
+                    transcript_status = 'done'
+                WHERE chat_id = ? AND message_id = ?
+                """,
+                (transcript_text.strip(), chat_id, reply_to_message_id),
+            )
+            return True
+
+    def get_recent_message_content(self, *, chat_id: int, limit: int = 100) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT mc.*, u.username, u.first_name, u.is_bot
+                FROM message_content mc
+                JOIN users u ON u.user_id = mc.user_id
+                WHERE mc.chat_id = ?
+                ORDER BY mc.message_date DESC, mc.message_id DESC
+                LIMIT ?
+                """,
+                (chat_id, limit),
+            ).fetchall()
+        return list(reversed(rows))
 
     def increment_mentions(self, *, chat_id: int, user_ids: list[int], day: date) -> None:
         if not user_ids:
