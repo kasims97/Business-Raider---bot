@@ -48,14 +48,14 @@ def build_application() -> Application:
 
 async def post_init(application: Application) -> None:
     group_commands = [
-        BotCommand("top", "Текущий рейтинг недели"),
-        BotCommand("myrating", "Личная статистика за неделю"),
-        BotCommand("summary", "Полные итоги недели"),
-        BotCommand("about", "Что это за бот"),
+        BotCommand("top", "show this week's ranking"),
+        BotCommand("myrating", "show your weekly stats"),
+        BotCommand("summary", "show full weekly results"),
+        BotCommand("about", "learn what this bot does"),
     ]
     private_commands = [
-        BotCommand("start", "Как пользоваться ботом"),
-        BotCommand("about", "Что это за бот"),
+        BotCommand("start", "learn how to use the bot"),
+        BotCommand("about", "learn what this bot does"),
     ]
     await application.bot.set_my_commands(
         group_commands,

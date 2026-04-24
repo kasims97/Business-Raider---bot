@@ -26,6 +26,7 @@ COMMAND_TOP = re.compile(r"^/(топ|top)(?:@\w+)?$")
 COMMAND_MY = re.compile(r"^/(мойрейтинг|myrating)(?:@\w+)?$")
 COMMAND_SUMMARY = re.compile(r"^/(итоги|summary)(?:@\w+)?$")
 COMMAND_ABOUT = re.compile(r"^/about(?:@\w+)?$")
+COMMAND_REP = re.compile(r"^/([+-])rep(?:@\w+)?$")
 
 
 class BotHandlers:
@@ -66,6 +67,10 @@ class BotHandlers:
             return
         if COMMAND_ABOUT.match(text):
             await self._send_about(update)
+            return
+        rep_match = COMMAND_REP.match(text)
+        if rep_match:
+            await self._handle_rep(update, rep_match.group(1))
             return
 
         self.storage.record_message(
@@ -176,9 +181,57 @@ class BotHandlers:
         await update.effective_message.reply_text(
             "Я бот рейтинга чата. Молча считаю активность за неделю: сообщения, "
             "полученные и отданные реакции, упоминания, пересылки из пабликов и кружочки. "
-            "По командам показываю рейтинг, а по воскресеньям автоматически выкатываю итоги и титулы недели.",
+            "По командам показываю рейтинг, а по воскресеньям автоматически выкатываю итоги и титулы недели. "
+            "Ещё умею /+rep и /-rep в ответ на сообщение участника: один голос от человека к человеку на неделю, "
+            "с возможностью поменять знак.",
             do_quote=False,
         )
+
+    async def _handle_rep(self, update: Update, sign: str) -> None:
+        message = update.effective_message
+        from_user = update.effective_user
+        chat = update.effective_chat
+        if message is None or from_user is None or chat is None:
+            return
+
+        replied = message.reply_to_message
+        target_user = replied.from_user if replied is not None else None
+        if replied is None or target_user is None or target_user.is_bot:
+            await message.reply_text(
+                "Используй эту команду ответом на сообщение участника чата.",
+                do_quote=False,
+            )
+            return
+
+        if target_user.id == from_user.id:
+            await message.reply_text(
+                "Самому себе rep крутить нельзя.",
+                do_quote=False,
+            )
+            return
+
+        now = self._localized(message.date)
+        result = self.storage.apply_rep_vote(
+            chat_id=chat.id,
+            week_start=week_start_for_dt(now),
+            from_user_id=from_user.id,
+            from_username=from_user.username,
+            from_first_name=from_user.first_name,
+            to_user_id=target_user.id,
+            to_username=target_user.username,
+            to_first_name=target_user.first_name,
+            value=1 if sign == "+" else -1,
+            voted_at=now,
+        )
+
+        target_name = f"@{target_user.username}" if target_user.username else target_user.first_name
+        if result == "unchanged":
+            text = f"У {target_name} уже стоит {sign}rep от тебя на этой неделе."
+        elif result == "flipped":
+            text = f"Ок, для {target_name} голос на этой неделе переключён на {sign}rep."
+        else:
+            text = f"Засчитано: {target_name} получил {sign}rep."
+        await message.reply_text(text, do_quote=False)
 
     def _build_summary_payload(self, week_start):
         stats = self.storage.get_week_stats(week_start)
@@ -200,7 +253,7 @@ class BotHandlers:
         if text.startswith("/start"):
             await update.effective_message.reply_text(
                 "Добавь меня в групповой чат, и я сам начну считать активность. "
-                "После привязки команды /top, /топ, /мойрейтинг, /итоги и /about работают в группе.",
+                "После привязки используй команды /top, /myrating, /summary, /about, а ещё /+rep и /-rep в ответ на сообщение участника.",
                 do_quote=False,
             )
 

@@ -7,9 +7,9 @@ Telegram bot that tracks weekly chat activity in a single group and posts rankin
 - Tracks messages, mentions, reactions received, reactions given
 - Tracks forwards from channels/publics and video notes
 - Commands:
-  - `/топ` or `/top`
-  - `/мойрейтинг` or `/myrating`
-  - `/итоги` or `/summary`
+  - `/top`
+  - `/myrating`
+  - `/summary`
   - `/about`
 - Weekly titles:
   - `🏆 Король чата`

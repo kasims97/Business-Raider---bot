@@ -74,6 +74,16 @@ class Storage:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS rep_votes (
+                    chat_id INTEGER NOT NULL,
+                    week TEXT NOT NULL,
+                    from_user_id INTEGER NOT NULL,
+                    to_user_id INTEGER NOT NULL,
+                    value INTEGER NOT NULL CHECK(value IN (-1, 1)),
+                    voted_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, week, from_user_id, to_user_id)
+                );
                 """
             )
 
@@ -216,6 +226,7 @@ class Storage:
     def get_week_stats(self, week_start: date) -> list[UserWeekStats]:
         start = week_start.isoformat()
         end = (week_start + timedelta(days=6)).isoformat()
+        week = week_key(week_start)
         with self.connect() as conn:
             rows = conn.execute(
                 """
@@ -223,20 +234,40 @@ class Storage:
                     u.user_id,
                     u.username,
                     u.first_name,
-                    COALESCE(SUM(a.messages), 0) AS messages,
-                    COALESCE(SUM(a.reactions_received), 0) AS reactions_received,
-                    COALESCE(SUM(a.reactions_given), 0) AS reactions_given,
-                    COALESCE(SUM(a.mentions), 0) AS mentions,
-                    COALESCE(SUM(a.forwards_public), 0) AS forwards_public,
-                    COALESCE(SUM(a.video_notes), 0) AS video_notes
+                    COALESCE(a.messages, 0) AS messages,
+                    COALESCE(a.reactions_received, 0) AS reactions_received,
+                    COALESCE(a.reactions_given, 0) AS reactions_given,
+                    COALESCE(a.mentions, 0) AS mentions,
+                    COALESCE(a.forwards_public, 0) AS forwards_public,
+                    COALESCE(a.video_notes, 0) AS video_notes,
+                    COALESCE(r.rep_plus, 0) AS rep_plus,
+                    COALESCE(r.rep_minus, 0) AS rep_minus
                 FROM users u
-                LEFT JOIN activity a
-                    ON a.user_id = u.user_id
-                    AND a.date BETWEEN ? AND ?
-                GROUP BY u.user_id, u.username, u.first_name
+                LEFT JOIN (
+                    SELECT
+                        user_id,
+                        SUM(messages) AS messages,
+                        SUM(reactions_received) AS reactions_received,
+                        SUM(reactions_given) AS reactions_given,
+                        SUM(mentions) AS mentions,
+                        SUM(forwards_public) AS forwards_public,
+                        SUM(video_notes) AS video_notes
+                    FROM activity
+                    WHERE date BETWEEN ? AND ?
+                    GROUP BY user_id
+                ) a ON a.user_id = u.user_id
+                LEFT JOIN (
+                    SELECT
+                        to_user_id AS user_id,
+                        SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END) AS rep_plus,
+                        SUM(CASE WHEN value = -1 THEN 1 ELSE 0 END) AS rep_minus
+                    FROM rep_votes
+                    WHERE week = ?
+                    GROUP BY to_user_id
+                ) r ON r.user_id = u.user_id
                 ORDER BY u.user_id
                 """,
-                (start, end),
+                (start, end, week),
             ).fetchall()
         return [
             UserWeekStats(
@@ -249,9 +280,59 @@ class Storage:
                 mentions=row["mentions"],
                 forwards_public=row["forwards_public"],
                 video_notes=row["video_notes"],
+                rep_plus=row["rep_plus"],
+                rep_minus=row["rep_minus"],
             )
             for row in rows
         ]
+
+    def apply_rep_vote(
+        self,
+        *,
+        chat_id: int,
+        week_start: date,
+        from_user_id: int,
+        from_username: str | None,
+        from_first_name: str,
+        to_user_id: int,
+        to_username: str | None,
+        to_first_name: str,
+        value: int,
+        voted_at: datetime,
+    ) -> str:
+        week = week_key(week_start)
+        with self.connect() as conn:
+            self._upsert_user(conn, from_user_id, from_username, from_first_name)
+            self._upsert_user(conn, to_user_id, to_username, to_first_name)
+            row = conn.execute(
+                """
+                SELECT value
+                FROM rep_votes
+                WHERE chat_id = ? AND week = ? AND from_user_id = ? AND to_user_id = ?
+                """,
+                (chat_id, week, from_user_id, to_user_id),
+            ).fetchone()
+            if row is not None and row["value"] == value:
+                return "unchanged"
+
+            conn.execute(
+                """
+                INSERT INTO rep_votes (chat_id, week, from_user_id, to_user_id, value, voted_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, week, from_user_id, to_user_id) DO UPDATE SET
+                    value = excluded.value,
+                    voted_at = excluded.voted_at
+                """,
+                (
+                    chat_id,
+                    week,
+                    from_user_id,
+                    to_user_id,
+                    value,
+                    voted_at.isoformat(),
+                ),
+            )
+            return "created" if row is None else "flipped"
 
     def save_titles(self, week_start: date, title_pairs: list[tuple[int, str]]) -> None:
         week = week_key(week_start)

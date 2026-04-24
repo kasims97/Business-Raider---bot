@@ -21,8 +21,9 @@ class RatingTests(unittest.TestCase):
                 reactions_received=2,
                 reactions_given=4,
                 mentions=3,
+                rep_balance=2,
             ),
-            24.0,
+            28.0,
         )
 
     def test_week_start_uses_monday(self) -> None:
@@ -51,6 +52,8 @@ class RatingTests(unittest.TestCase):
                 reactions_received=5,
                 forwards_public=2,
                 video_notes=1,
+                rep_plus=3,
+                rep_minus=1,
             ),
             UserWeekStats(
                 user_id=2,
@@ -60,6 +63,7 @@ class RatingTests(unittest.TestCase):
                 reactions_received=0,
                 forwards_public=0,
                 video_notes=0,
+                rep_minus=2,
             ),
         ]
         titles = dict((title, user_id) for user_id, title in pick_titles(stats))

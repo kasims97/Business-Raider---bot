@@ -25,6 +25,8 @@ class UserWeekStats:
     mentions: int = 0
     forwards_public: int = 0
     video_notes: int = 0
+    rep_plus: int = 0
+    rep_minus: int = 0
 
     @property
     def score(self) -> float:
@@ -33,6 +35,7 @@ class UserWeekStats:
             reactions_received=self.reactions_received,
             reactions_given=self.reactions_given,
             mentions=self.mentions,
+            rep_balance=self.rep_balance,
         )
 
     @property
@@ -41,6 +44,10 @@ class UserWeekStats:
             return f"@{self.username}"
         return self.first_name
 
+    @property
+    def rep_balance(self) -> int:
+        return self.rep_plus - self.rep_minus
+
 
 def compute_score(
     *,
@@ -48,12 +55,14 @@ def compute_score(
     reactions_received: int,
     reactions_given: int,
     mentions: int,
+    rep_balance: int = 0,
 ) -> float:
     return (
         messages * 1
         + reactions_received * 3
         + mentions * 2
         + reactions_given * 0.5
+        + rep_balance * 2
     )
 
 
@@ -130,7 +139,8 @@ def format_ranking(stats: list[UserWeekStats], title: str) -> str:
         lines.append(
             f"{idx}. {item.display_name} — {format_score(item.score)} "
             f"(сообщения {item.messages}, реакции+ {item.reactions_received}, "
-            f"реакции→ {item.reactions_given}, упоминания {item.mentions})"
+            f"реакции→ {item.reactions_given}, упоминания {item.mentions}, "
+            f"rep +{item.rep_plus}/-{item.rep_minus})"
         )
     return "\n".join(lines)
 
@@ -151,6 +161,7 @@ def format_personal_stats(
         f"Упоминания: {stats.mentions}",
         f"Пересылки из пабликов: {stats.forwards_public}",
         f"Кружочки: {stats.video_notes}",
+        f"Репутация: +{stats.rep_plus} / -{stats.rep_minus} (итог {stats.rep_balance:+d})",
     ]
     if titles:
         lines.extend(["", "Титулы этой недели:"] + titles)
