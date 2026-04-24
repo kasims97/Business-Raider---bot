@@ -37,6 +37,6 @@ python -m bot.main
 - Create one service from this repo
 - Attach a persistent volume and mount it to `/data`
 - Set `DB_PATH=/data/bot.sqlite3`
-- Set `BOT_TOKEN`, `CHAT_ID`, `TZ`, `POST_HOUR`, `POST_MINUTE`
+- Set `BOT_TOKEN`, `TZ`, `POST_HOUR`, `POST_MINUTE`
 
 The app uses long polling, so no webhook setup is required.
