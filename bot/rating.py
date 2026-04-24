@@ -132,15 +132,16 @@ def format_score(value: float) -> str:
 
 def format_ranking(stats: list[UserWeekStats], title: str) -> str:
     if not stats:
-        return f"{title}\n\nПока пусто. Никто ничего не писал."
+        return f"{title}\n\nПока тихо. Как только в чате начнётся движ, здесь появится рейтинг."
 
     lines = [title, ""]
     for idx, item in enumerate(stats, start=1):
         lines.append(
-            f"{idx}. {item.display_name} — {format_score(item.score)} "
-            f"(сообщения {item.messages}, реакции+ {item.reactions_received}, "
-            f"реакции→ {item.reactions_given}, упоминания {item.mentions}, "
-            f"rep +{item.rep_plus}/-{item.rep_minus})"
+            f"{idx}. {item.display_name} — {format_score(item.score)} очков"
+        )
+        lines.append(
+            f"{item.messages} сообщений • {item.reactions_received} реакций • "
+            f"{item.mentions} упоминаний • rep {item.rep_balance:+d}"
         )
     return "\n".join(lines)
 
@@ -152,8 +153,8 @@ def format_personal_stats(
     titles: list[str],
 ) -> str:
     lines = [
-        f"Ты на {rank} месте из {total}.",
-        f"Очки: {format_score(stats.score)}",
+        f"Твоё место: {rank} из {total}",
+        f"Очки за неделю: {format_score(stats.score)}",
         "",
         f"Сообщения: {stats.messages}",
         f"Реакции получил: {stats.reactions_received}",
@@ -172,23 +173,29 @@ def format_weekly_summary(
     week_start: date,
     ranked: list[UserWeekStats],
     titles: list[tuple[UserWeekStats, str]],
+    *,
+    official: bool,
 ) -> str:
     week_end = week_start + timedelta(days=6)
     lines = [
-        f"Итоги недели {week_start.strftime('%d.%m')}–{week_end.strftime('%d.%m')}",
+        (
+            f"Итоги недели {week_start.strftime('%d.%m')}–{week_end.strftime('%d.%m')}"
+            if official
+            else f"Промежуточные итоги недели {week_start.strftime('%d.%m')}–{week_end.strftime('%d.%m')}"
+        ),
         "",
         "Рейтинг:",
     ]
     if ranked:
         for idx, item in enumerate(ranked, start=1):
-            lines.append(f"{idx}. {item.display_name} — {format_score(item.score)}")
+            lines.append(f"{idx}. {item.display_name} — {format_score(item.score)} очков")
     else:
-        lines.append("Пока пусто.")
+        lines.append("Пока тихо. На этой неделе рейтинг ещё не собрался.")
 
     lines.extend(["", "Титулы:"])
     if titles:
         for item, title in titles:
             lines.append(f"{title} — {item.display_name}")
     else:
-        lines.append("На этой неделе без титулов.")
+        lines.append("На этой неделе пока без титулов.")
     return "\n".join(lines)

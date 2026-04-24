@@ -3,7 +3,14 @@ from __future__ import annotations
 import logging
 
 from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
-from telegram.ext import Application, Defaults, MessageHandler, MessageReactionHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    Defaults,
+    MessageHandler,
+    MessageReactionHandler,
+    filters,
+)
 
 from bot.config import Settings
 from bot.handlers import BotHandlers
@@ -29,6 +36,7 @@ def build_application() -> Application:
     handlers = BotHandlers(storage=storage, settings=settings)
 
     application.add_handler(MessageHandler(~filters.StatusUpdate.ALL, handlers.on_message))
+    application.add_handler(CallbackQueryHandler(handlers.on_callback_query, pattern=r"^rep:"))
     application.add_handler(
         MessageReactionHandler(
             handlers.on_message_reaction,
@@ -48,14 +56,15 @@ def build_application() -> Application:
 
 async def post_init(application: Application) -> None:
     group_commands = [
-        BotCommand("top", "show this week's ranking"),
-        BotCommand("myrating", "show your weekly stats"),
-        BotCommand("summary", "show full weekly results"),
-        BotCommand("about", "learn what this bot does"),
+        BotCommand("top", "рейтинг недели"),
+        BotCommand("myrating", "твоя статистика"),
+        BotCommand("summary", "промежуточные итоги недели"),
+        BotCommand("rep", "дать +rep или -rep участнику"),
+        BotCommand("about", "что умеет бот"),
     ]
     private_commands = [
-        BotCommand("start", "learn how to use the bot"),
-        BotCommand("about", "learn what this bot does"),
+        BotCommand("start", "как пользоваться ботом"),
+        BotCommand("about", "что умеет бот"),
     ]
     await application.bot.set_my_commands(
         group_commands,
@@ -71,7 +80,7 @@ def main() -> None:
     application = build_application()
     logging.getLogger(__name__).info("Bot started")
     application.run_polling(
-        allowed_updates=["message", "message_reaction"],
+        allowed_updates=["message", "message_reaction", "callback_query"],
         drop_pending_updates=False,
     )
 

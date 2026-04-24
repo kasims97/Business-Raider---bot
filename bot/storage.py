@@ -4,6 +4,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Iterator
 
 from bot.rating import UserWeekStats, week_key
@@ -32,7 +33,8 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     username TEXT,
-                    first_name TEXT NOT NULL
+                    first_name TEXT NOT NULL,
+                    is_bot INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS activity (
@@ -84,21 +86,57 @@ class Storage:
                     voted_at TEXT NOT NULL,
                     PRIMARY KEY (chat_id, week, from_user_id, to_user_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS chat_members (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, user_id)
+                );
                 """
             )
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()
+            }
+            if "is_bot" not in columns:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0"
+                )
 
-    def upsert_user(self, user_id: int, username: str | None, first_name: str) -> None:
+    def upsert_user(
+        self,
+        user_id: int,
+        username: str | None,
+        first_name: str,
+        is_bot: bool = False,
+    ) -> None:
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO users (user_id, username, first_name)
-                VALUES (?, ?, ?)
+                INSERT INTO users (user_id, username, first_name, is_bot)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     username = excluded.username,
-                    first_name = excluded.first_name
+                    first_name = excluded.first_name,
+                    is_bot = excluded.is_bot
                 """,
-                (user_id, username, first_name),
+                (user_id, username, first_name, int(is_bot)),
             )
+
+    def register_chat_presence(
+        self,
+        *,
+        chat_id: int,
+        user_id: int,
+        username: str | None,
+        first_name: str,
+        is_bot: bool,
+        seen_at: date,
+    ) -> None:
+        with self.connect() as conn:
+            self._upsert_user(conn, user_id, username, first_name, is_bot)
+            self._touch_chat_member(conn, chat_id, user_id, seen_at.isoformat())
 
     def record_message(
         self,
@@ -108,12 +146,14 @@ class Storage:
         user_id: int,
         username: str | None,
         first_name: str,
+        is_bot: bool,
         day: date,
         is_forward_public: bool,
         is_video_note: bool,
     ) -> None:
         with self.connect() as conn:
-            self._upsert_user(conn, user_id, username, first_name)
+            self._upsert_user(conn, user_id, username, first_name, is_bot)
+            self._touch_chat_member(conn, chat_id, user_id, day.isoformat())
             self._ensure_activity_row(conn, user_id, day.isoformat())
             conn.execute(
                 """
@@ -134,11 +174,12 @@ class Storage:
                 (chat_id, message_id, user_id, day.isoformat()),
             )
 
-    def increment_mentions(self, user_ids: list[int], day: date) -> None:
+    def increment_mentions(self, *, chat_id: int, user_ids: list[int], day: date) -> None:
         if not user_ids:
             return
         with self.connect() as conn:
             for user_id in user_ids:
+                self._touch_chat_member(conn, chat_id, user_id, day.isoformat())
                 self._ensure_activity_row(conn, user_id, day.isoformat())
                 conn.execute(
                     """
@@ -152,16 +193,19 @@ class Storage:
     def increment_reactions_given(
         self,
         *,
+        chat_id: int,
         user_id: int,
         username: str | None,
         first_name: str,
+        is_bot: bool,
         day: date,
         delta: int,
     ) -> None:
         if delta == 0:
             return
         with self.connect() as conn:
-            self._upsert_user(conn, user_id, username, first_name)
+            self._upsert_user(conn, user_id, username, first_name, is_bot)
+            self._touch_chat_member(conn, chat_id, user_id, day.isoformat())
             self._ensure_activity_row(conn, user_id, day.isoformat())
             conn.execute(
                 """
@@ -172,14 +216,21 @@ class Storage:
                 (delta, user_id, day.isoformat()),
             )
 
-    def apply_reaction_delta(self, *, chat_id: int, message_id: int, delta: int) -> bool:
+    def apply_reaction_delta(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        day: date,
+        delta: int,
+    ) -> bool:
         if delta == 0:
             return False
 
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT user_id, message_date, reactions_received
+                SELECT user_id
                 FROM message_stats
                 WHERE chat_id = ? AND message_id = ?
                 """,
@@ -188,14 +239,15 @@ class Storage:
             if row is None:
                 return False
 
-            self._ensure_activity_row(conn, row["user_id"], row["message_date"])
+            self._touch_chat_member(conn, chat_id, row["user_id"], day.isoformat())
+            self._ensure_activity_row(conn, row["user_id"], day.isoformat())
             conn.execute(
                 """
                 UPDATE activity
                 SET reactions_received = reactions_received + ?
                 WHERE user_id = ? AND date = ?
                 """,
-                (delta, row["user_id"], row["message_date"]),
+                (delta, row["user_id"], day.isoformat()),
             )
             conn.execute(
                 """
@@ -269,7 +321,7 @@ class Storage:
                 """,
                 (start, end, week),
             ).fetchall()
-        return [
+        stats = [
             UserWeekStats(
                 user_id=row["user_id"],
                 username=row["username"],
@@ -285,6 +337,59 @@ class Storage:
             )
             for row in rows
         ]
+        return [item for item in stats if self._has_week_activity(item)]
+
+    def list_rep_candidates(self, *, chat_id: int, exclude_user_id: int) -> list[SimpleNamespace]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT u.user_id, u.username, u.first_name
+                FROM chat_members cm
+                JOIN users u ON u.user_id = cm.user_id
+                WHERE cm.chat_id = ?
+                  AND u.user_id != ?
+                  AND u.is_bot = 0
+                ORDER BY
+                    CASE WHEN username IS NULL OR username = '' THEN 1 ELSE 0 END,
+                    LOWER(COALESCE(username, first_name)),
+                    u.user_id
+                """,
+                (chat_id, exclude_user_id),
+            ).fetchall()
+            if not rows:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO chat_members (chat_id, user_id, first_seen_at, last_seen_at)
+                    SELECT ?, user_id, DATE('now'), DATE('now')
+                    FROM users
+                    WHERE user_id != ?
+                      AND is_bot = 0
+                    """,
+                    (chat_id, exclude_user_id),
+                )
+                rows = conn.execute(
+                    """
+                    SELECT u.user_id, u.username, u.first_name
+                    FROM chat_members cm
+                    JOIN users u ON u.user_id = cm.user_id
+                    WHERE cm.chat_id = ?
+                      AND u.user_id != ?
+                      AND u.is_bot = 0
+                    ORDER BY
+                        CASE WHEN username IS NULL OR username = '' THEN 1 ELSE 0 END,
+                        LOWER(COALESCE(username, first_name)),
+                        u.user_id
+                    """,
+                    (chat_id, exclude_user_id),
+                ).fetchall()
+        return [
+            SimpleNamespace(
+                user_id=row["user_id"],
+                username=row["username"],
+                first_name=row["first_name"],
+            )
+            for row in rows
+        ]
 
     def apply_rep_vote(
         self,
@@ -294,16 +399,22 @@ class Storage:
         from_user_id: int,
         from_username: str | None,
         from_first_name: str,
+        from_is_bot: bool,
         to_user_id: int,
         to_username: str | None,
         to_first_name: str,
+        to_is_bot: bool,
         value: int,
         voted_at: datetime,
     ) -> str:
         week = week_key(week_start)
         with self.connect() as conn:
-            self._upsert_user(conn, from_user_id, from_username, from_first_name)
-            self._upsert_user(conn, to_user_id, to_username, to_first_name)
+            self._upsert_user(
+                conn, from_user_id, from_username, from_first_name, from_is_bot
+            )
+            self._upsert_user(conn, to_user_id, to_username, to_first_name, to_is_bot)
+            self._touch_chat_member(conn, chat_id, from_user_id, voted_at.date().isoformat())
+            self._touch_chat_member(conn, chat_id, to_user_id, voted_at.date().isoformat())
             row = conn.execute(
                 """
                 SELECT value
@@ -403,16 +514,18 @@ class Storage:
         user_id: int,
         username: str | None,
         first_name: str,
+        is_bot: bool = False,
     ) -> None:
         conn.execute(
             """
-            INSERT INTO users (user_id, username, first_name)
-            VALUES (?, ?, ?)
+            INSERT INTO users (user_id, username, first_name, is_bot)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 username = excluded.username,
-                first_name = excluded.first_name
+                first_name = excluded.first_name,
+                is_bot = excluded.is_bot
             """,
-            (user_id, username, first_name),
+            (user_id, username, first_name, int(is_bot)),
         )
 
     def _ensure_activity_row(self, conn: sqlite3.Connection, user_id: int, day: str) -> None:
@@ -425,4 +538,35 @@ class Storage:
             VALUES (?, ?, 0, 0, 0, 0, 0, 0)
             """,
             (user_id, day),
+        )
+
+    def _touch_chat_member(
+        self,
+        conn: sqlite3.Connection,
+        chat_id: int,
+        user_id: int,
+        seen_at: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO chat_members (chat_id, user_id, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                last_seen_at = excluded.last_seen_at
+            """,
+            (chat_id, user_id, seen_at, seen_at),
+        )
+
+    def _has_week_activity(self, item: UserWeekStats) -> bool:
+        return any(
+            (
+                item.messages,
+                item.reactions_received,
+                item.reactions_given,
+                item.mentions,
+                item.forwards_public,
+                item.video_notes,
+                item.rep_plus,
+                item.rep_minus,
+            )
         )
