@@ -26,16 +26,10 @@ def build_application() -> Application:
 
     handlers = BotHandlers(storage=storage, settings=settings)
 
-    application.add_handler(
-        MessageHandler(
-            filters.Chat(chat_id=settings.chat_id) & ~filters.StatusUpdate.ALL,
-            handlers.on_message,
-        )
-    )
+    application.add_handler(MessageHandler(~filters.StatusUpdate.ALL, handlers.on_message))
     application.add_handler(
         MessageReactionHandler(
             handlers.on_message_reaction,
-            chat_id=settings.chat_id,
             message_reaction_types=MessageReactionHandler.MESSAGE_REACTION_UPDATED,
         )
     )

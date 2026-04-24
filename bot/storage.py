@@ -69,6 +69,11 @@ class Storage:
                     week TEXT PRIMARY KEY,
                     posted_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """
             )
 
@@ -273,6 +278,23 @@ class Storage:
                 (week, user_id),
             ).fetchall()
         return [row["title"] for row in rows]
+
+    def get_active_chat_id(self) -> int | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM bot_state WHERE key = 'active_chat_id'"
+            ).fetchone()
+        return int(row["value"]) if row else None
+
+    def set_active_chat_id(self, chat_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO bot_state (key, value)
+                VALUES ('active_chat_id', ?)
+                """,
+                (str(chat_id),),
+            )
 
     def report_already_posted(self, week_start: date) -> bool:
         week = week_key(week_start)
