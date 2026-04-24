@@ -13,6 +13,16 @@ TITLE_NEWSMAKER = "📰 Ньюсмейкер"
 TITLE_BLOGGER = "🎥 Блогер"
 TITLE_USELESS = "🪫 Беспонтовый"
 
+TITLE_DESCRIPTIONS = {
+    TITLE_KING: "первое место по общему рейтингу",
+    TITLE_SILENT: "меньше всех сообщений за неделю",
+    TITLE_FAVORITE: "больше всех полученных реакций",
+    TITLE_ACTIVE: "больше всех сообщений в чате",
+    TITLE_NEWSMAKER: "больше всех пересылок из пабликов",
+    TITLE_BLOGGER: "больше всех отправленных кружочков",
+    TITLE_USELESS: "самый слабый результат по общему рейтингу",
+}
+
 
 @dataclass(slots=True)
 class UserWeekStats:
@@ -195,7 +205,11 @@ def format_weekly_summary(
     lines.extend(["", "Титулы:"])
     if titles:
         for item, title in titles:
-            lines.append(f"{title} — {item.display_name}")
+            description = TITLE_DESCRIPTIONS.get(title, "")
+            if description:
+                lines.append(f"{title} — {item.display_name} — {description}")
+            else:
+                lines.append(f"{title} — {item.display_name}")
     else:
         lines.append("На этой неделе пока без титулов.")
     return "\n".join(lines)
