@@ -37,12 +37,18 @@ class BotHandlers:
         user = update.effective_user
         if message is None or user is None:
             return
-        if not self._is_target_chat(update):
+        chat = update.effective_chat
+        if chat is None:
             return
-        if update.effective_chat is None or update.effective_chat.type not in {
-            ChatType.GROUP,
-            ChatType.SUPERGROUP,
-        }:
+
+        if chat.type == ChatType.PRIVATE:
+            await self._handle_private_message(update)
+            return
+
+        if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+            return
+
+        if not self._is_target_chat(chat.id):
             return
 
         now = self._localized(message.date)
@@ -76,7 +82,7 @@ class BotHandlers:
         reaction = update.message_reaction
         if reaction is None:
             return
-        if reaction.chat.id != self.settings.chat_id:
+        if not self._is_target_chat(reaction.chat.id):
             return
 
         current_day = self._localized(reaction.date).date()
@@ -117,8 +123,12 @@ class BotHandlers:
         if self.storage.report_already_posted(week_start):
             return
 
+        chat_id = self._active_chat_id()
+        if chat_id is None:
+            return
+
         text = self._build_summary_payload(week_start)
-        await context.bot.send_message(chat_id=self.settings.chat_id, text=text)
+        await context.bot.send_message(chat_id=chat_id, text=text)
         self.storage.mark_report_posted(week_start, now)
 
     async def _send_top(self, update: Update) -> None:
@@ -166,9 +176,26 @@ class BotHandlers:
         ]
         return format_weekly_summary(week_start, ranked, titled_items)
 
-    def _is_target_chat(self, update: Update) -> bool:
-        chat = update.effective_chat
-        return chat is not None and chat.id == self.settings.chat_id
+    async def _handle_private_message(self, update: Update) -> None:
+        if update.effective_message is None:
+            return
+        text = (update.effective_message.text or "").strip()
+        if text.startswith("/start"):
+            await update.effective_message.reply_text(
+                "Добавь меня в групповой чат, и я сам начну считать активность. "
+                "После привязки команды /top, /топ, /мойрейтинг и /итоги работают в группе."
+            )
+
+    def _active_chat_id(self) -> int | None:
+        return self.settings.chat_id or self.storage.get_active_chat_id()
+
+    def _is_target_chat(self, chat_id: int) -> bool:
+        active_chat_id = self._active_chat_id()
+        if active_chat_id is None:
+            self.storage.set_active_chat_id(chat_id)
+            logger.info("Bound bot to chat_id=%s", chat_id)
+            return True
+        return chat_id == active_chat_id
 
     def _localized(self, dt: datetime) -> datetime:
         return dt.astimezone(self.settings.timezone)

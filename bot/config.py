@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 @dataclass(slots=True)
 class Settings:
     bot_token: str
-    chat_id: int
+    chat_id: int | None
     timezone: ZoneInfo
     post_hour: int
     post_minute: int
@@ -20,7 +20,8 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         bot_token = _require_env("BOT_TOKEN")
-        chat_id = int(_require_env("CHAT_ID"))
+        chat_id_raw = os.getenv("CHAT_ID")
+        chat_id = int(chat_id_raw) if chat_id_raw else None
         timezone = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
         post_hour = int(os.getenv("POST_HOUR", "21"))
         post_minute = int(os.getenv("POST_MINUTE", "0"))
