@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chat-rating-bot"
+version = "0.1.0"
+description = "Telegram bot for weekly chat activity ratings"
+requires-python = ">=3.12"
+dependencies = [
+    "python-telegram-bot[job-queue]>=22.6,<23.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,0 +1,1 @@
+"""Chat rating bot package."""
