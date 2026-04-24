@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 COMMAND_TOP = re.compile(r"^/(топ|top)(?:@\w+)?$")
 COMMAND_MY = re.compile(r"^/(мойрейтинг|myrating)(?:@\w+)?$")
 COMMAND_SUMMARY = re.compile(r"^/(итоги|summary)(?:@\w+)?$")
+COMMAND_ABOUT = re.compile(r"^/about(?:@\w+)?$")
 
 
 class BotHandlers:
@@ -62,6 +63,9 @@ class BotHandlers:
             return
         if COMMAND_SUMMARY.match(text):
             await self._send_summary(update)
+            return
+        if COMMAND_ABOUT.match(text):
+            await self._send_about(update)
             return
 
         self.storage.record_message(
@@ -166,6 +170,16 @@ class BotHandlers:
         text = self._build_summary_payload(week_start)
         await update.effective_message.reply_text(text, do_quote=False)
 
+    async def _send_about(self, update: Update) -> None:
+        if update.effective_message is None:
+            return
+        await update.effective_message.reply_text(
+            "Я бот рейтинга чата. Молча считаю активность за неделю: сообщения, "
+            "полученные и отданные реакции, упоминания, пересылки из пабликов и кружочки. "
+            "По командам показываю рейтинг, а по воскресеньям автоматически выкатываю итоги и титулы недели.",
+            do_quote=False,
+        )
+
     def _build_summary_payload(self, week_start):
         stats = self.storage.get_week_stats(week_start)
         ranked = sort_for_ranking(stats)
@@ -186,7 +200,7 @@ class BotHandlers:
         if text.startswith("/start"):
             await update.effective_message.reply_text(
                 "Добавь меня в групповой чат, и я сам начну считать активность. "
-                "После привязки команды /top, /топ, /мойрейтинг и /итоги работают в группе.",
+                "После привязки команды /top, /топ, /мойрейтинг, /итоги и /about работают в группе.",
                 do_quote=False,
             )
 

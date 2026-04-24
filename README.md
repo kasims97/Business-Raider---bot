@@ -10,6 +10,7 @@ Telegram bot that tracks weekly chat activity in a single group and posts rankin
   - `/топ` or `/top`
   - `/мойрейтинг` or `/myrating`
   - `/итоги` or `/summary`
+  - `/about`
 - Weekly titles:
   - `🏆 Король чата`
   - `🤫 Молчун`
