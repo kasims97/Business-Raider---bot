@@ -13,7 +13,6 @@ from bot.ai import SummaryError, summarize_chat
 from bot.config import Settings
 from bot.rating import (
     format_personal_stats,
-    format_ranking,
     format_weekly_summary,
     pick_titles,
     sort_for_ranking,
@@ -23,7 +22,6 @@ from bot.storage import Storage
 
 logger = logging.getLogger(__name__)
 
-COMMAND_TOP = re.compile(r"^/(топ|top)(?:@\w+)?$")
 COMMAND_MY = re.compile(r"^/(мойрейтинг|myrating)(?:@\w+)?$")
 COMMAND_SUMMARY = re.compile(r"^/(итоги|summary)(?:@\w+)?$")
 COMMAND_ABOUT = re.compile(r"^/about(?:@\w+)?$")
@@ -65,9 +63,6 @@ class BotHandlers:
         if self._maybe_capture_salute_transcript(update):
             return
 
-        if COMMAND_TOP.match(text):
-            await self._send_top(update)
-            return
         if COMMAND_MY.match(text):
             await self._send_personal(update)
             return
@@ -213,17 +208,6 @@ class BotHandlers:
             text = self._build_summary_payload(chat_id, week_start, save_titles=True)
             await context.bot.send_message(chat_id=chat_id, text=text)
             self.storage.mark_report_posted(chat_id, week_start, now)
-
-    async def _send_top(self, update: Update) -> None:
-        message = update.effective_message
-        chat = update.effective_chat
-        if message is None or chat is None:
-            return
-        now = datetime.now(self.settings.timezone)
-        week_start = week_start_for_dt(now)
-        ranked = sort_for_ranking(self.storage.get_week_stats(chat.id, week_start))
-        text = format_ranking(ranked, "Рейтинг недели")
-        await message.reply_text(text, do_quote=False)
 
     async def _send_personal(self, update: Update) -> None:
         user = update.effective_user
@@ -504,7 +488,7 @@ class BotHandlers:
         if text.startswith("/start"):
             await message.reply_text(
                 "Добавь меня в группу, и я начну вести рейтинг чата. В группе доступны команды: "
-                "/top, /myrating, /summary, /rep, /+rep, /-rep, /catchup и /about.",
+                "/myrating, /summary, /rep, /+rep, /-rep, /catchup и /about.",
                 do_quote=False,
             )
         elif text.startswith("/about"):

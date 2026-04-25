@@ -56,7 +56,6 @@ def build_application() -> Application:
 
 async def post_init(application: Application) -> None:
     group_commands = [
-        BotCommand("top", "рейтинг недели"),
         BotCommand("myrating", "твоя статистика"),
         BotCommand("summary", "промежуточные итоги недели"),
         BotCommand("rep", "дать +rep или -rep участнику"),
