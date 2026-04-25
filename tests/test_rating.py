@@ -137,7 +137,7 @@ class RatingTests(unittest.TestCase):
             self.assertEqual(unchanged, "unchanged")
             self.assertEqual(flipped, "flipped")
 
-            stats = {item.user_id: item for item in storage.get_week_stats(week_start)}
+            stats = {item.user_id: item for item in storage.get_week_stats(1, week_start)}
             self.assertEqual(stats[20].rep_plus, 0)
             self.assertEqual(stats[20].rep_minus, 1)
             self.assertEqual(stats[20].rep_balance, -1)
@@ -197,8 +197,8 @@ class RatingTests(unittest.TestCase):
                 delta=1,
             )
 
-            first_week = {item.user_id: item for item in storage.get_week_stats(date(2026, 4, 20))}
-            second_week = {item.user_id: item for item in storage.get_week_stats(date(2026, 4, 27))}
+            first_week = {item.user_id: item for item in storage.get_week_stats(1, date(2026, 4, 20))}
+            second_week = {item.user_id: item for item in storage.get_week_stats(1, date(2026, 4, 27))}
             self.assertEqual(first_week[5].reactions_received, 0)
             self.assertEqual(second_week[5].reactions_received, 1)
 
@@ -207,7 +207,45 @@ class RatingTests(unittest.TestCase):
             storage = Storage(Path(tmpdir) / "bot.sqlite3")
             storage.init()
             storage.upsert_user(1, "idle", "Idle", is_bot=False)
-            self.assertEqual(storage.get_week_stats(date(2026, 4, 20)), [])
+            self.assertEqual(storage.get_week_stats(1, date(2026, 4, 20)), [])
+
+    def test_multi_chat_stats_and_reports_are_isolated(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            storage = Storage(Path(tmpdir) / "bot.sqlite3")
+            storage.init()
+            day = date(2026, 4, 20)
+
+            storage.record_message(
+                chat_id=100,
+                message_id=1,
+                user_id=1,
+                username="one",
+                first_name="One",
+                is_bot=False,
+                day=day,
+                is_forward_public=False,
+                is_video_note=False,
+            )
+            storage.record_message(
+                chat_id=200,
+                message_id=1,
+                user_id=2,
+                username="two",
+                first_name="Two",
+                is_bot=False,
+                day=day,
+                is_forward_public=False,
+                is_video_note=False,
+            )
+
+            chat_100 = storage.get_week_stats(100, day)
+            chat_200 = storage.get_week_stats(200, day)
+            self.assertEqual([item.user_id for item in chat_100], [1])
+            self.assertEqual([item.user_id for item in chat_200], [2])
+
+            storage.mark_report_posted(100, day, datetime(2026, 4, 26, 21, 0, tzinfo=ZoneInfo("Europe/Moscow")))
+            self.assertTrue(storage.report_already_posted(100, day))
+            self.assertFalse(storage.report_already_posted(200, day))
 
     def test_summary_preview_does_not_save_titles(self) -> None:
         try:
@@ -244,7 +282,7 @@ class RatingTests(unittest.TestCase):
             )
             settings = Settings(
                 bot_token="x",
-                chat_id=100,
+                chat_id=None,
                 timezone=ZoneInfo("Europe/Moscow"),
                 post_hour=21,
                 post_minute=0,
@@ -252,10 +290,10 @@ class RatingTests(unittest.TestCase):
             )
             handlers = BotHandlers(storage=storage, settings=settings)
 
-            text = handlers._build_summary_payload(week_start, save_titles=False)
+            text = handlers._build_summary_payload(100, week_start, save_titles=False)
 
-            self.assertIn("Срез недели", text)
-            self.assertEqual(storage.get_titles_for_user(week_start, 1), [])
+            self.assertIn("Промежуточные итоги недели", text)
+            self.assertEqual(storage.get_titles_for_user(100, week_start, 1), [])
 
     def test_message_content_and_salute_transcript_storage(self) -> None:
         with TemporaryDirectory() as tmpdir:

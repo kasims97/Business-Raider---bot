@@ -40,10 +40,8 @@ class BotHandlers:
     async def on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
         user = update.effective_user
-        if message is None or user is None:
-            return
         chat = update.effective_chat
-        if chat is None:
+        if message is None or user is None or chat is None:
             return
 
         if chat.type == ChatType.PRIVATE:
@@ -51,9 +49,6 @@ class BotHandlers:
             return
 
         if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
-            return
-
-        if not self._is_target_chat(chat.id):
             return
 
         now = self._localized(message.date)
@@ -88,11 +83,10 @@ class BotHandlers:
         if COMMAND_REP.match(text):
             await self._show_rep_user_picker(update)
             return
-        if COMMAND_OLD_REP.match(text):
-            await message.reply_text(
-                "Теперь всё через /rep: выбери участника и потом поставь +rep или -rep.",
-                do_quote=False,
-            )
+
+        old_rep_match = COMMAND_OLD_REP.match(text)
+        if old_rep_match:
+            await self._handle_reply_rep(update, old_rep_match.group(1))
             return
 
         self.storage.record_message(
@@ -129,11 +123,16 @@ class BotHandlers:
         reaction = update.message_reaction
         if reaction is None:
             return
-        if not self._is_target_chat(reaction.chat.id):
-            return
 
         current_day = self._localized(reaction.date).date()
         delta = len(reaction.new_reaction) - len(reaction.old_reaction)
+        logger.info(
+            "Reaction update chat_id=%s message_id=%s delta=%s has_user=%s",
+            reaction.chat.id,
+            reaction.message_id,
+            delta,
+            reaction.user is not None,
+        )
         if delta == 0:
             return
 
@@ -145,7 +144,8 @@ class BotHandlers:
         )
         if not applied:
             logger.info(
-                "Skipping reaction for unknown message %s/%s",
+                "Skipping reaction for unknown message chat_id=%s message_id=%s. "
+                "Бот увидел реакцию, но не видел исходное сообщение.",
                 reaction.chat.id,
                 reaction.message_id,
             )
@@ -177,7 +177,7 @@ class BotHandlers:
                 await query.answer("Это меню не для тебя", show_alert=True)
                 return
             await query.answer()
-            await query.edit_message_text("Выбор rep отменён.")
+            await query.edit_message_text("Выбор репутации отменён.")
             return
 
         if data.startswith("rep:u:"):
@@ -205,59 +205,67 @@ class BotHandlers:
             return
 
         week_start = week_start_for_dt(now)
-        if self.storage.report_already_posted(week_start):
-            return
-
-        chat_id = self._active_chat_id()
-        if chat_id is None:
-            return
-
-        text = self._build_summary_payload(week_start, save_titles=True)
-        await context.bot.send_message(chat_id=chat_id, text=text)
-        self.storage.mark_report_posted(week_start, now)
+        for chat_id in self.storage.list_known_chats():
+            if self.storage.report_already_posted(chat_id, week_start):
+                continue
+            if not self.storage.get_week_stats(chat_id, week_start):
+                continue
+            text = self._build_summary_payload(chat_id, week_start, save_titles=True)
+            await context.bot.send_message(chat_id=chat_id, text=text)
+            self.storage.mark_report_posted(chat_id, week_start, now)
 
     async def _send_top(self, update: Update) -> None:
+        message = update.effective_message
+        chat = update.effective_chat
+        if message is None or chat is None:
+            return
         now = datetime.now(self.settings.timezone)
         week_start = week_start_for_dt(now)
-        ranked = sort_for_ranking(self.storage.get_week_stats(week_start))
+        ranked = sort_for_ranking(self.storage.get_week_stats(chat.id, week_start))
         text = format_ranking(ranked, "Рейтинг недели")
-        await update.effective_message.reply_text(text, do_quote=False)
+        await message.reply_text(text, do_quote=False)
 
     async def _send_personal(self, update: Update) -> None:
         user = update.effective_user
-        if user is None or update.effective_message is None:
+        message = update.effective_message
+        chat = update.effective_chat
+        if user is None or message is None or chat is None:
             return
 
         now = datetime.now(self.settings.timezone)
         week_start = week_start_for_dt(now)
-        ranked = sort_for_ranking(self.storage.get_week_stats(week_start))
+        ranked = sort_for_ranking(self.storage.get_week_stats(chat.id, week_start))
         for idx, item in enumerate(ranked, start=1):
             if item.user_id == user.id:
-                titles = self.storage.get_titles_for_user(week_start, user.id)
+                titles = self.storage.get_titles_for_user(chat.id, week_start, user.id)
                 text = format_personal_stats(item, idx, len(ranked), titles)
-                await update.effective_message.reply_text(text, do_quote=False)
+                await message.reply_text(text, do_quote=False)
                 return
 
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "Пока пусто: на этой неделе у тебя ещё нет активности в рейтинге.",
             do_quote=False,
         )
 
     async def _send_summary(self, update: Update) -> None:
-        if update.effective_message is None:
+        message = update.effective_message
+        chat = update.effective_chat
+        if message is None or chat is None:
             return
         now = datetime.now(self.settings.timezone)
         week_start = week_start_for_dt(now)
-        text = self._build_summary_payload(week_start, save_titles=False)
-        await update.effective_message.reply_text(text, do_quote=False)
+        text = self._build_summary_payload(chat.id, week_start, save_titles=False)
+        await message.reply_text(text, do_quote=False)
 
     async def _send_about(self, update: Update) -> None:
-        if update.effective_message is None:
+        message = update.effective_message
+        if message is None:
             return
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "Я бот рейтинга чата. Слежу за активностью в течение недели, показываю, кто тащит движ, "
-            "а по воскресеньям публикую итоги и титулы. Через /rep можно дать участнику +rep или -rep в репутацию. "
-            "А через /catchup можно получить краткую выжимку последних 100 сообщений.",
+            "а по воскресеньям публикую итоги и титулы. Через /rep или reply-команды /+rep и /-rep можно "
+            "дать участнику плюс или минус в репутацию. А через /catchup можно получить краткую выжимку "
+            "последних 100 сообщений.",
             do_quote=False,
         )
 
@@ -337,11 +345,10 @@ class BotHandlers:
         labels = self._build_candidate_labels(candidates)
         keyboard = []
         for candidate in candidates:
-            label = labels[candidate.user_id]
             keyboard.append(
                 [
                     InlineKeyboardButton(
-                        label,
+                        labels[candidate.user_id],
                         callback_data=self._rep_pick_user_data(
                             target_user_id=candidate.user_id,
                             owner_user_id=from_user.id,
@@ -404,9 +411,53 @@ class BotHandlers:
             await query.edit_message_text("Этот участник больше недоступен для выбора.")
             return
 
+        text = self._apply_rep_vote(
+            chat_id=chat.id,
+            actor=actor,
+            target=target,
+            sign=sign,
+        )
+        await query.edit_message_text(text)
+
+    async def _handle_reply_rep(self, update: Update, sign: str) -> None:
+        message = update.effective_message
+        actor = update.effective_user
+        chat = update.effective_chat
+        if message is None or actor is None or chat is None:
+            return
+
+        reply = message.reply_to_message
+        target_user = reply.from_user if reply is not None else None
+        if reply is None or target_user is None:
+            await message.reply_text(
+                "Используй эту команду ответом на сообщение участника.",
+                do_quote=False,
+            )
+            return
+        if target_user.id == actor.id:
+            await message.reply_text("Себе rep ставить нельзя.", do_quote=False)
+            return
+        if target_user.is_bot:
+            await message.reply_text("Ботам rep не ставится.", do_quote=False)
+            return
+
+        target = type("RepTarget", (), {
+            "user_id": target_user.id,
+            "username": target_user.username,
+            "first_name": target_user.first_name,
+        })()
+        text = self._apply_rep_vote(
+            chat_id=chat.id,
+            actor=actor,
+            target=target,
+            sign=sign,
+        )
+        await message.reply_text(text, do_quote=False)
+
+    def _apply_rep_vote(self, *, chat_id: int, actor, target, sign: str) -> str:
         now = datetime.now(self.settings.timezone)
         result = self.storage.apply_rep_vote(
-            chat_id=chat.id,
+            chat_id=chat_id,
             week_start=week_start_for_dt(now),
             from_user_id=actor.id,
             from_username=actor.username,
@@ -419,22 +470,19 @@ class BotHandlers:
             value=1 if sign == "+" else -1,
             voted_at=now,
         )
-
         target_name = self._build_candidate_labels([target])[target.user_id]
         if result == "unchanged":
-            text = f"У {target_name} уже стоит {sign}rep от тебя на этой неделе."
-        elif result == "flipped":
-            text = f"Голос переключён: {target_name} теперь получил {sign}rep."
-        else:
-            text = f"Засчитано: {target_name} получил {sign}rep."
-        await query.edit_message_text(text)
+            return f"У {target_name} уже стоит {sign}rep от тебя на этой неделе."
+        if result == "flipped":
+            return f"Голос переключён: {target_name} теперь получил {sign}rep."
+        return f"Засчитано: {target_name} получил {sign}rep."
 
-    def _build_summary_payload(self, week_start, *, save_titles: bool) -> str:
-        stats = self.storage.get_week_stats(week_start)
+    def _build_summary_payload(self, chat_id: int, week_start, *, save_titles: bool) -> str:
+        stats = self.storage.get_week_stats(chat_id, week_start)
         ranked = sort_for_ranking(stats)
         title_pairs = pick_titles(stats)
         if save_titles:
-            self.storage.save_titles(week_start, title_pairs)
+            self.storage.save_titles(chat_id, week_start, title_pairs)
         by_user_id = {item.user_id: item for item in stats}
         titled_items = [
             (by_user_id[user_id], title)
@@ -449,28 +497,18 @@ class BotHandlers:
         )
 
     async def _handle_private_message(self, update: Update) -> None:
-        if update.effective_message is None:
+        message = update.effective_message
+        if message is None:
             return
-        text = (update.effective_message.text or "").strip()
+        text = (message.text or "").strip()
         if text.startswith("/start"):
-            await update.effective_message.reply_text(
+            await message.reply_text(
                 "Добавь меня в группу, и я начну вести рейтинг чата. В группе доступны команды: "
-                "/top, /myrating, /summary, /rep, /catchup и /about.",
+                "/top, /myrating, /summary, /rep, /+rep, /-rep, /catchup и /about.",
                 do_quote=False,
             )
         elif text.startswith("/about"):
             await self._send_about(update)
-
-    def _active_chat_id(self) -> int | None:
-        return self.settings.chat_id or self.storage.get_active_chat_id()
-
-    def _is_target_chat(self, chat_id: int) -> bool:
-        active_chat_id = self._active_chat_id()
-        if active_chat_id is None:
-            self.storage.set_active_chat_id(chat_id)
-            logger.info("Bound bot to chat_id=%s", chat_id)
-            return True
-        return chat_id == active_chat_id
 
     def _localized(self, dt: datetime) -> datetime:
         return dt.astimezone(self.settings.timezone)
@@ -544,7 +582,7 @@ class BotHandlers:
         for candidate in candidates:
             label = candidate.first_name
             if candidate.username:
-                label = f"{candidate.first_name} (@{candidate.username})"
+                label = f"{candidate.first_name} (t.me/{candidate.username})"
             base_labels[candidate.user_id] = label
             counts[label] += 1
 
@@ -581,12 +619,11 @@ class BotHandlers:
         transcript = self._extract_salute_transcript_text(message)
         if not transcript:
             return False
-        saved = self.storage.save_salute_transcript(
+        return self.storage.save_salute_transcript(
             chat_id=chat.id,
             reply_to_message_id=message.reply_to_message.message_id,
             transcript_text=transcript,
         )
-        return saved
 
     def _extract_salute_transcript_text(self, message) -> str | None:
         text = (message.text or message.caption or "").strip()
@@ -629,7 +666,9 @@ class BotHandlers:
         return "not_needed"
 
     def _message_row_to_summary_block(self, row) -> str | None:
-        name = f"@{row['username']}" if row["username"] else row["first_name"]
+        name = row["first_name"]
+        if row["username"]:
+            name = f"{row['first_name']} (t.me/{row['username']})"
         message_type = row["message_type"]
         if message_type in {"voice", "video_note"}:
             transcript = row["transcript_text"]

@@ -51,7 +51,7 @@ class UserWeekStats:
     @property
     def display_name(self) -> str:
         if self.username:
-            return f"@{self.username}"
+            return f"{self.first_name} (https://t.me/{self.username})"
         return self.first_name
 
     @property

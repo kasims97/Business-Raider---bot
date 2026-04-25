@@ -50,11 +50,34 @@ class Storage:
                     FOREIGN KEY (user_id) REFERENCES users (user_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS activity_by_chat (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    date TEXT NOT NULL,
+                    messages INTEGER NOT NULL DEFAULT 0,
+                    reactions_received INTEGER NOT NULL DEFAULT 0,
+                    reactions_given INTEGER NOT NULL DEFAULT 0,
+                    mentions INTEGER NOT NULL DEFAULT 0,
+                    forwards_public INTEGER NOT NULL DEFAULT 0,
+                    video_notes INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (chat_id, user_id, date),
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS titles (
                     user_id INTEGER NOT NULL,
                     week TEXT NOT NULL,
                     title TEXT NOT NULL,
                     PRIMARY KEY (week, title),
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS titles_by_chat (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    week TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, week, title),
                     FOREIGN KEY (user_id) REFERENCES users (user_id)
                 );
 
@@ -70,6 +93,13 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS weekly_reports (
                     week TEXT PRIMARY KEY,
                     posted_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS weekly_reports_by_chat (
+                    chat_id INTEGER NOT NULL,
+                    week TEXT NOT NULL,
+                    posted_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, week)
                 );
 
                 CREATE TABLE IF NOT EXISTS bot_state (
@@ -111,13 +141,8 @@ class Storage:
                 );
                 """
             )
-            columns = {
-                row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()
-            }
-            if "is_bot" not in columns:
-                conn.execute(
-                    "ALTER TABLE users ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0"
-                )
+            self._ensure_users_columns(conn)
+            self._migrate_single_chat_data(conn)
 
     def upsert_user(
         self,
@@ -127,17 +152,7 @@ class Storage:
         is_bot: bool = False,
     ) -> None:
         with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO users (user_id, username, first_name, is_bot)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    username = excluded.username,
-                    first_name = excluded.first_name,
-                    is_bot = excluded.is_bot
-                """,
-                (user_id, username, first_name, int(is_bot)),
-            )
+            self._upsert_user(conn, user_id, username, first_name, is_bot)
 
     def register_chat_presence(
         self,
@@ -169,16 +184,22 @@ class Storage:
         with self.connect() as conn:
             self._upsert_user(conn, user_id, username, first_name, is_bot)
             self._touch_chat_member(conn, chat_id, user_id, day.isoformat())
-            self._ensure_activity_row(conn, user_id, day.isoformat())
+            self._ensure_activity_row(conn, chat_id, user_id, day.isoformat())
             conn.execute(
                 """
-                UPDATE activity
+                UPDATE activity_by_chat
                 SET messages = messages + 1,
                     forwards_public = forwards_public + ?,
                     video_notes = video_notes + ?
-                WHERE user_id = ? AND date = ?
+                WHERE chat_id = ? AND user_id = ? AND date = ?
                 """,
-                (1 if is_forward_public else 0, 1 if is_video_note else 0, user_id, day.isoformat()),
+                (
+                    1 if is_forward_public else 0,
+                    1 if is_video_note else 0,
+                    chat_id,
+                    user_id,
+                    day.isoformat(),
+                ),
             )
             conn.execute(
                 """
@@ -287,14 +308,14 @@ class Storage:
         with self.connect() as conn:
             for user_id in user_ids:
                 self._touch_chat_member(conn, chat_id, user_id, day.isoformat())
-                self._ensure_activity_row(conn, user_id, day.isoformat())
+                self._ensure_activity_row(conn, chat_id, user_id, day.isoformat())
                 conn.execute(
                     """
-                    UPDATE activity
+                    UPDATE activity_by_chat
                     SET mentions = mentions + 1
-                    WHERE user_id = ? AND date = ?
+                    WHERE chat_id = ? AND user_id = ? AND date = ?
                     """,
-                    (user_id, day.isoformat()),
+                    (chat_id, user_id, day.isoformat()),
                 )
 
     def increment_reactions_given(
@@ -313,14 +334,14 @@ class Storage:
         with self.connect() as conn:
             self._upsert_user(conn, user_id, username, first_name, is_bot)
             self._touch_chat_member(conn, chat_id, user_id, day.isoformat())
-            self._ensure_activity_row(conn, user_id, day.isoformat())
+            self._ensure_activity_row(conn, chat_id, user_id, day.isoformat())
             conn.execute(
                 """
-                UPDATE activity
+                UPDATE activity_by_chat
                 SET reactions_given = reactions_given + ?
-                WHERE user_id = ? AND date = ?
+                WHERE chat_id = ? AND user_id = ? AND date = ?
                 """,
-                (delta, user_id, day.isoformat()),
+                (delta, chat_id, user_id, day.isoformat()),
             )
 
     def apply_reaction_delta(
@@ -347,14 +368,14 @@ class Storage:
                 return False
 
             self._touch_chat_member(conn, chat_id, row["user_id"], day.isoformat())
-            self._ensure_activity_row(conn, row["user_id"], day.isoformat())
+            self._ensure_activity_row(conn, chat_id, row["user_id"], day.isoformat())
             conn.execute(
                 """
-                UPDATE activity
+                UPDATE activity_by_chat
                 SET reactions_received = reactions_received + ?
-                WHERE user_id = ? AND date = ?
+                WHERE chat_id = ? AND user_id = ? AND date = ?
                 """,
-                (delta, row["user_id"], day.isoformat()),
+                (delta, chat_id, row["user_id"], day.isoformat()),
             )
             conn.execute(
                 """
@@ -382,7 +403,7 @@ class Storage:
             ).fetchall()
         return {row["username"]: row["user_id"] for row in rows if row["username"]}
 
-    def get_week_stats(self, week_start: date) -> list[UserWeekStats]:
+    def get_week_stats(self, chat_id: int, week_start: date) -> list[UserWeekStats]:
         start = week_start.isoformat()
         end = (week_start + timedelta(days=6)).isoformat()
         week = week_key(week_start)
@@ -401,9 +422,11 @@ class Storage:
                     COALESCE(a.video_notes, 0) AS video_notes,
                     COALESCE(r.rep_plus, 0) AS rep_plus,
                     COALESCE(r.rep_minus, 0) AS rep_minus
-                FROM users u
+                FROM chat_members cm
+                JOIN users u ON u.user_id = cm.user_id
                 LEFT JOIN (
                     SELECT
+                        chat_id,
                         user_id,
                         SUM(messages) AS messages,
                         SUM(reactions_received) AS reactions_received,
@@ -411,22 +434,24 @@ class Storage:
                         SUM(mentions) AS mentions,
                         SUM(forwards_public) AS forwards_public,
                         SUM(video_notes) AS video_notes
-                    FROM activity
-                    WHERE date BETWEEN ? AND ?
-                    GROUP BY user_id
-                ) a ON a.user_id = u.user_id
+                    FROM activity_by_chat
+                    WHERE chat_id = ? AND date BETWEEN ? AND ?
+                    GROUP BY chat_id, user_id
+                ) a ON a.chat_id = cm.chat_id AND a.user_id = cm.user_id
                 LEFT JOIN (
                     SELECT
+                        chat_id,
                         to_user_id AS user_id,
                         SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END) AS rep_plus,
                         SUM(CASE WHEN value = -1 THEN 1 ELSE 0 END) AS rep_minus
                     FROM rep_votes
-                    WHERE week = ?
-                    GROUP BY to_user_id
-                ) r ON r.user_id = u.user_id
+                    WHERE chat_id = ? AND week = ?
+                    GROUP BY chat_id, to_user_id
+                ) r ON r.chat_id = cm.chat_id AND r.user_id = cm.user_id
+                WHERE cm.chat_id = ?
                 ORDER BY u.user_id
                 """,
-                (start, end, week),
+                (chat_id, start, end, chat_id, week, chat_id),
             ).fetchall()
         stats = [
             UserWeekStats(
@@ -464,31 +489,21 @@ class Storage:
                 (chat_id, exclude_user_id),
             ).fetchall()
             if not rows:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO chat_members (chat_id, user_id, first_seen_at, last_seen_at)
-                    SELECT ?, user_id, DATE('now'), DATE('now')
-                    FROM users
-                    WHERE user_id != ?
-                      AND is_bot = 0
-                    """,
-                    (chat_id, exclude_user_id),
-                )
                 rows = conn.execute(
                     """
                     SELECT u.user_id, u.username, u.first_name
-                    FROM chat_members cm
-                    JOIN users u ON u.user_id = cm.user_id
-                    WHERE cm.chat_id = ?
-                      AND u.user_id != ?
+                    FROM users u
+                    WHERE u.user_id != ?
                       AND u.is_bot = 0
                     ORDER BY
                         CASE WHEN username IS NULL OR username = '' THEN 1 ELSE 0 END,
                         LOWER(COALESCE(username, first_name)),
                         u.user_id
                     """,
-                    (chat_id, exclude_user_id),
+                    (exclude_user_id,),
                 ).fetchall()
+                for row in rows:
+                    self._touch_chat_member(conn, chat_id, row["user_id"], date.today().isoformat())
         return [
             SimpleNamespace(
                 user_id=row["user_id"],
@@ -552,31 +567,67 @@ class Storage:
             )
             return "created" if row is None else "flipped"
 
-    def save_titles(self, week_start: date, title_pairs: list[tuple[int, str]]) -> None:
+    def save_titles(
+        self,
+        chat_id: int,
+        week_start: date,
+        title_pairs: list[tuple[int, str]],
+    ) -> None:
         week = week_key(week_start)
         with self.connect() as conn:
             for user_id, title in title_pairs:
                 conn.execute(
                     """
-                    INSERT OR REPLACE INTO titles (user_id, week, title)
-                    VALUES (?, ?, ?)
+                    INSERT OR REPLACE INTO titles_by_chat (chat_id, user_id, week, title)
+                    VALUES (?, ?, ?, ?)
                     """,
-                    (user_id, week, title),
+                    (chat_id, user_id, week, title),
                 )
 
-    def get_titles_for_user(self, week_start: date, user_id: int) -> list[str]:
+    def get_titles_for_user(self, chat_id: int, week_start: date, user_id: int) -> list[str]:
         week = week_key(week_start)
         with self.connect() as conn:
             rows = conn.execute(
                 """
                 SELECT title
-                FROM titles
-                WHERE week = ? AND user_id = ?
+                FROM titles_by_chat
+                WHERE chat_id = ? AND week = ? AND user_id = ?
                 ORDER BY title
                 """,
-                (week, user_id),
+                (chat_id, week, user_id),
             ).fetchall()
         return [row["title"] for row in rows]
+
+    def report_already_posted(self, chat_id: int, week_start: date) -> bool:
+        week = week_key(week_start)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM weekly_reports_by_chat WHERE chat_id = ? AND week = ?",
+                (chat_id, week),
+            ).fetchone()
+        return row is not None
+
+    def mark_report_posted(self, chat_id: int, week_start: date, posted_at: datetime) -> None:
+        week = week_key(week_start)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO weekly_reports_by_chat (chat_id, week, posted_at)
+                VALUES (?, ?, ?)
+                """,
+                (chat_id, week, posted_at.isoformat()),
+            )
+
+    def list_known_chats(self) -> list[int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT chat_id
+                FROM chat_members
+                ORDER BY chat_id
+                """
+            ).fetchall()
+        return [row["chat_id"] for row in rows]
 
     def get_active_chat_id(self) -> int | None:
         with self.connect() as conn:
@@ -595,25 +646,68 @@ class Storage:
                 (str(chat_id),),
             )
 
-    def report_already_posted(self, week_start: date) -> bool:
-        week = week_key(week_start)
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM weekly_reports WHERE week = ?",
-                (week,),
-            ).fetchone()
-        return row is not None
+    def _ensure_users_columns(self, conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "is_bot" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0"
+            )
 
-    def mark_report_posted(self, week_start: date, posted_at: datetime) -> None:
-        week = week_key(week_start)
-        with self.connect() as conn:
+    def _migrate_single_chat_data(self, conn: sqlite3.Connection) -> None:
+        active_chat_id = self._read_active_chat_id(conn)
+        if active_chat_id is None:
+            return
+
+        has_new_activity = conn.execute(
+            "SELECT 1 FROM activity_by_chat LIMIT 1"
+        ).fetchone()
+        if has_new_activity is None:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO weekly_reports (week, posted_at)
-                VALUES (?, ?)
+                INSERT OR IGNORE INTO activity_by_chat (
+                    chat_id, user_id, date, messages, reactions_received,
+                    reactions_given, mentions, forwards_public, video_notes
+                )
+                SELECT ?, user_id, date, messages, reactions_received,
+                       reactions_given, mentions, forwards_public, video_notes
+                FROM activity
                 """,
-                (week, posted_at.isoformat()),
+                (active_chat_id,),
             )
+
+        has_new_titles = conn.execute(
+            "SELECT 1 FROM titles_by_chat LIMIT 1"
+        ).fetchone()
+        if has_new_titles is None:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO titles_by_chat (chat_id, user_id, week, title)
+                SELECT ?, user_id, week, title
+                FROM titles
+                """,
+                (active_chat_id,),
+            )
+
+        has_new_reports = conn.execute(
+            "SELECT 1 FROM weekly_reports_by_chat LIMIT 1"
+        ).fetchone()
+        if has_new_reports is None:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO weekly_reports_by_chat (chat_id, week, posted_at)
+                SELECT ?, week, posted_at
+                FROM weekly_reports
+                """,
+                (active_chat_id,),
+            )
+
+    def _read_active_chat_id(self, conn: sqlite3.Connection) -> int | None:
+        row = conn.execute(
+            "SELECT value FROM bot_state WHERE key = 'active_chat_id'"
+        ).fetchone()
+        return int(row["value"]) if row else None
 
     def _upsert_user(
         self,
@@ -635,16 +729,22 @@ class Storage:
             (user_id, username, first_name, int(is_bot)),
         )
 
-    def _ensure_activity_row(self, conn: sqlite3.Connection, user_id: int, day: str) -> None:
+    def _ensure_activity_row(
+        self,
+        conn: sqlite3.Connection,
+        chat_id: int,
+        user_id: int,
+        day: str,
+    ) -> None:
         conn.execute(
             """
-            INSERT OR IGNORE INTO activity (
-                user_id, date, messages, reactions_received, reactions_given,
+            INSERT OR IGNORE INTO activity_by_chat (
+                chat_id, user_id, date, messages, reactions_received, reactions_given,
                 mentions, forwards_public, video_notes
             )
-            VALUES (?, ?, 0, 0, 0, 0, 0, 0)
+            VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0)
             """,
-            (user_id, day),
+            (chat_id, user_id, day),
         )
 
     def _touch_chat_member(
