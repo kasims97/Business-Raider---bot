@@ -296,10 +296,9 @@ class BotHandlers:
                 transcript_blocks=blocks,
                 missing_audio_count=missing_audio,
             )
-        except SummaryError:
-            await status_message.edit_text(
-                "Не получилось собрать резюме прямо сейчас. Попробуй ещё раз чуть позже."
-            )
+        except SummaryError as exc:
+            logger.error("summarize_chat failed: %s", exc)
+            await status_message.edit_text(exc.public_message)
             return
 
         if missing_audio:
