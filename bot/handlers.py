@@ -275,7 +275,10 @@ class BotHandlers:
         blocks: list[str] = []
         missing_audio = 0
         for row in rows:
-            if row["is_bot"] and row["username"] and row["username"].lower() == self.settings.salute_bot_username:
+            if self._is_salute_row(row):
+                block = self._salute_row_to_summary_block(row)
+                if block:
+                    blocks.append(block)
                 continue
             block = self._message_row_to_summary_block(row)
             if block is None:
@@ -602,11 +605,18 @@ class BotHandlers:
         transcript = self._extract_salute_transcript_text(message)
         if not transcript:
             return False
-        return self.storage.save_salute_transcript(
+        saved = self.storage.save_salute_transcript(
             chat_id=chat.id,
             reply_to_message_id=message.reply_to_message.message_id,
             transcript_text=transcript,
         )
+        if not saved:
+            logger.info(
+                "Salute transcript was not linked chat_id=%s reply_to_message_id=%s",
+                chat.id,
+                message.reply_to_message.message_id,
+            )
+        return saved
 
     def _extract_salute_transcript_text(self, message) -> str | None:
         text = (message.text or message.caption or "").strip()
@@ -665,3 +675,32 @@ class BotHandlers:
         if message_type == "forward":
             text = f"[переслано] {text}"
         return f"{name}: {text}"
+
+    def _is_salute_row(self, row) -> bool:
+        return bool(
+            row["is_bot"]
+            and row["username"]
+            and row["username"].lower() == self.settings.salute_bot_username
+        )
+
+    def _salute_row_to_summary_block(self, row) -> str | None:
+        text = (row["text_content"] or "").strip()
+        if not text:
+            return None
+        cleaned = self._extract_transcript_text_from_plain_text(text)
+        if not cleaned:
+            return None
+        return f"SaluteSpeech: [расшифровка] {cleaned}"
+
+    def _extract_transcript_text_from_plain_text(self, text: str) -> str | None:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return None
+        service_lines = {"voice message", "video note"}
+        lower_lines = [line.lower() for line in lines]
+        for idx, line in enumerate(lower_lines):
+            if line in service_lines and idx + 1 < len(lines):
+                return " ".join(lines[idx + 1 :]).strip()
+        if len(lines) >= 2 and lower_lines[0] not in service_lines:
+            return " ".join(lines[1:]).strip()
+        return text.strip()
