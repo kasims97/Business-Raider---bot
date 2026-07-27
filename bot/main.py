@@ -44,7 +44,7 @@ def build_application() -> Application:
 
 async def post_init(application: Application) -> None:
     group_commands = [
-        BotCommand("бот", "открыть меню турнирного бота"),
+        BotCommand("menu", "открыть меню турнирного бота"),
         BotCommand("table", "таблица турнира"),
         BotCommand("match", "текущий матч"),
         BotCommand("league", "лига за всё время"),
