@@ -106,5 +106,33 @@ class PendingTextGatingTests(unittest.IsolatedAsyncioTestCase):
         self.storage.clear_pending_input.assert_called_once_with(chat_id=100, user_id=1)
 
 
+class MvpSelfVoteTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.storage = MagicMock()
+        self.handlers = BotHandlers(storage=self.storage, settings=make_settings())
+
+    async def test_cannot_vote_for_self(self) -> None:
+        query = SimpleNamespace(
+            from_user=make_user(1, "Касим"),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            message=SimpleNamespace(reply_markup=None),
+        )
+        await self.handlers._handle_mvp_callback(query, ["mv", "5", "1"])
+        query.answer.assert_called_once_with("За себя голосовать нельзя.", show_alert=True)
+        self.storage.cast_mvp_vote.assert_not_called()
+
+    async def test_can_vote_for_someone_else(self) -> None:
+        self.storage.get_mvp_tally.return_value = []
+        query = SimpleNamespace(
+            from_user=make_user(1, "Касим"),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            message=SimpleNamespace(reply_markup=None),
+        )
+        await self.handlers._handle_mvp_callback(query, ["mv", "5", "2"])
+        self.storage.cast_mvp_vote.assert_called_once_with(tournament_id=5, voter_id=1, pick_user_id=2)
+
+
 if __name__ == "__main__":
     unittest.main()

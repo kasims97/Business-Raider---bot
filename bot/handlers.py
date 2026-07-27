@@ -144,7 +144,7 @@ class BotHandlers:
             return
         await message.reply_text(
             "Привет! Добавь меня в группу — там я веду турнирную таблицу PUBG/CS. "
-            "В группе команда /бот открывает меню.",
+            "В группе команда /menu открывает меню.",
             do_quote=False,
         )
 
@@ -249,7 +249,7 @@ class BotHandlers:
         tournament = self.storage.get_active_tournament(chat.id)
         if tournament is None:
             await message.reply_text(
-                "Сейчас турнир не идёт. Открой /бот → 🏆 Новый турнир.", do_quote=False
+                "Сейчас турнир не идёт. Открой /menu → 🏆 Новый турнир.", do_quote=False
             )
             return
         live = self.storage.get_live_match(tournament["tournament_id"])
@@ -273,11 +273,18 @@ class BotHandlers:
 
     async def _send_about(self, update: Update) -> None:
         message = update.effective_message
-        await message.reply_text(
-            "Я турнирный бот PUBG/CS. Команда /бот открывает меню: заводишь турнир, дальше во время "
-            "игры только жмёшь кнопки — убийства, топы, победы команд. Веду таблицу, историю, лигу "
-            "за всё время и разбор от GPT.",
-            do_quote=False,
+        await message.reply_text(self._about_text(), do_quote=False)
+
+    def _about_text(self) -> str:
+        return (
+            "🎮 Как этим пользоваться\n\n"
+            "1. /menu — открыть меню\n"
+            "2. 🏆 Новый турнир — выбрать игру, режим и кто играет (один раз в начале вечера)\n"
+            "3. Дальше во время игры — только кнопки: ➕ засчитывает убийство и спросит, кого убили; "
+            "🏆 — взял топ (или «Победила А/Б» в команде)\n"
+            "4. ✅ Матч сыгран — бот публикует таблицу и сразу открывает следующий матч с тем же составом\n"
+            "5. 🏁 Завершить турнир — итоговая таблица, кто кого убивал, титулы и разбор от GPT\n\n"
+            "Если запутался — просто набери /menu, там всё видно кнопками."
         )
 
     # -- main menu -----------------------------------------------------------
@@ -310,7 +317,12 @@ class BotHandlers:
                 InlineKeyboardButton("🗂 Прошлые турниры", callback_data="mn:tournaments"),
             ]
         )
-        rows.append([InlineKeyboardButton("⚙️ Настройки", callback_data="mn:settings")])
+        rows.append(
+            [
+                InlineKeyboardButton("⚙️ Настройки", callback_data="mn:settings"),
+                InlineKeyboardButton("ℹ️ Как этим пользоваться", callback_data="mn:about"),
+            ]
+        )
         return "🎮 Турнирный бот", InlineKeyboardMarkup(rows)
 
     def _back_to_menu_kb(self) -> InlineKeyboardMarkup:
@@ -371,6 +383,9 @@ class BotHandlers:
             await query.answer()
             text, kb = self._render_settings_screen(chat_id)
             await query.edit_message_text(text, reply_markup=kb)
+        elif action == "about":
+            await query.answer()
+            await query.edit_message_text(self._about_text(), reply_markup=self._back_to_menu_kb())
         else:
             await query.answer()
 
@@ -874,9 +889,14 @@ class BotHandlers:
                         ]
                     ]
                 )
-                await query.edit_message_text(
-                    f"Точно завершить турнир? Сыграно матчей: {len(saved)}", reply_markup=kb
-                )
+                prompt = f"Точно завершить турнир? Сыграно матчей: {len(saved)}."
+                if self.storage.match_has_progress(match_id):
+                    prompt += (
+                        f"\n\n⚠️ Текущий матч #{live['match_no']} ещё не сохранён — "
+                        "если завершить турнир сейчас, его убийства и топы пропадут. "
+                        "Сначала нажми «✅ Матч сыгран», если хочешь его сохранить."
+                    )
+                await query.edit_message_text(prompt, reply_markup=kb)
                 return
             if parts[2] == "no":
                 await query.answer()
@@ -931,6 +951,9 @@ class BotHandlers:
 
     async def _handle_mvp_callback(self, query, parts: list[str]) -> None:
         tournament_id, user_id = int(parts[1]), int(parts[2])
+        if query.from_user.id == user_id:
+            await query.answer("За себя голосовать нельзя.", show_alert=True)
+            return
         self.storage.cast_mvp_vote(
             tournament_id=tournament_id, voter_id=query.from_user.id, pick_user_id=user_id
         )
@@ -980,10 +1003,10 @@ class BotHandlers:
             await query.message.reply_text("\n".join(title_lines), do_quote=False)
 
         predictions = self.storage.get_predictions(tournament_id)
-        if predictions:
-            champion = ranked[0] if ranked else None
-            hit = [p["voter_name"] for p in predictions if champion and p["pick_user_id"] == champion.user_id]
-            miss = [p["voter_name"] for p in predictions if not champion or p["pick_user_id"] != champion.user_id]
+        if predictions and ranked:
+            champion = ranked[0]
+            hit = [p["voter_name"] for p in predictions if p["pick_user_id"] == champion.user_id]
+            miss = [p["voter_name"] for p in predictions if p["pick_user_id"] != champion.user_id]
             pred_lines = ["🔮 Прогнозы"]
             if hit:
                 pred_lines.append("✅ Угадали: " + ", ".join(hit))

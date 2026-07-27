@@ -345,6 +345,24 @@ class Storage:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM matches WHERE match_id = ?", (match_id,)).fetchone()
 
+    def match_has_progress(self, match_id: int) -> bool:
+        """True if anyone has recorded a kill/top/win in this (still unsaved) match."""
+        with self.connect() as conn:
+            has_kill = conn.execute(
+                "SELECT 1 FROM kills WHERE match_id = ? LIMIT 1", (match_id,)
+            ).fetchone()
+            if has_kill is not None:
+                return True
+            has_top = conn.execute(
+                "SELECT 1 FROM match_players WHERE match_id = ? AND top = 1 LIMIT 1", (match_id,)
+            ).fetchone()
+            if has_top is not None:
+                return True
+            match = conn.execute(
+                "SELECT winner_team FROM matches WHERE match_id = ?", (match_id,)
+            ).fetchone()
+            return bool(match and match["winner_team"] is not None)
+
     def get_match_players(self, match_id: int) -> list[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute(

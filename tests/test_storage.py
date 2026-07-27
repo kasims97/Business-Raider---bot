@@ -209,6 +209,35 @@ class StorageTests(unittest.TestCase):
         self.storage.toggle_setting(CHAT, "quips")
         self.assertTrue(self.storage.get_setting(CHAT, "quips"))
 
+    def test_match_has_progress_false_for_fresh_match(self) -> None:
+        tid = self._setup_solo_tournament()
+        match_id = self.storage.start_tournament(tid)
+        self.assertFalse(self.storage.match_has_progress(match_id))
+
+    def test_match_has_progress_true_after_kill(self) -> None:
+        tid = self._setup_solo_tournament()
+        match_id = self.storage.start_tournament(tid)
+        self.storage.record_kill(match_id=match_id, killer_id=1, victim_id=2)
+        self.assertTrue(self.storage.match_has_progress(match_id))
+
+    def test_match_has_progress_true_after_top(self) -> None:
+        tid = self._setup_solo_tournament()
+        match_id = self.storage.start_tournament(tid)
+        self.storage.toggle_top(match_id=match_id, user_id=1)
+        self.assertTrue(self.storage.match_has_progress(match_id))
+
+    def test_match_has_progress_true_after_team_win_set(self) -> None:
+        tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1)
+        self.storage.set_draft_name(tid, "Team Cup")
+        self.storage.set_draft_game(tid, "cs")
+        self.storage.set_draft_mode(tid, True)
+        self.storage.toggle_draft_player(tid, 1, True)
+        self.storage.toggle_draft_player(tid, 2, True)
+        match_id = self.storage.start_tournament(tid)
+        self.assertFalse(self.storage.match_has_progress(match_id))
+        self.storage.set_winner_team(match_id=match_id, team=1)
+        self.assertTrue(self.storage.match_has_progress(match_id))
+
     def test_match_results_sequence_reflects_top_and_team_wins(self) -> None:
         tid = self._setup_solo_tournament()
         match1 = self.storage.start_tournament(tid)
