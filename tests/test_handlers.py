@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
 from telegram import MessageEntity
@@ -61,6 +61,49 @@ class RegisterIncidentalUsersTests(unittest.TestCase):
         message = SimpleNamespace(reply_to_message=None, entities=())
         self.handlers._register_incidental_users(message, chat_id=100, now=self.now)
         self.storage.register_chat_presence.assert_not_called()
+
+
+class PendingTextGatingTests(unittest.IsolatedAsyncioTestCase):
+    """Regression test: tapping '+ Add player' must not swallow the next
+    unrelated chat message as a player name — only an actual reply to the
+    bot's own prompt counts."""
+
+    def setUp(self) -> None:
+        self.storage = MagicMock()
+        self.handlers = BotHandlers(storage=self.storage, settings=make_settings())
+        self.chat = SimpleNamespace(id=100)
+        self.user = make_user(1, "Касим")
+
+    def _make_update(self, text: str, reply_to_message_id: int | None):
+        reply_to = SimpleNamespace(message_id=reply_to_message_id) if reply_to_message_id else None
+        message = SimpleNamespace(
+            text=text,
+            date=datetime.now(ZoneInfo("Europe/Moscow")),
+            reply_to_message=reply_to,
+            reply_text=AsyncMock(),
+        )
+        return SimpleNamespace(effective_message=message, effective_user=self.user, effective_chat=self.chat)
+
+    async def test_unrelated_message_is_ignored_not_added_as_player(self) -> None:
+        self.storage.get_pending_input.return_value = {"kind": "add_player:menu", "prompt_message_id": 42}
+        update = self._make_update("протестим короч", reply_to_message_id=None)
+        await self.handlers._handle_pending_text(update)
+        self.storage.add_guest_player.assert_not_called()
+        self.storage.clear_pending_input.assert_not_called()
+
+    async def test_reply_to_wrong_message_is_ignored(self) -> None:
+        self.storage.get_pending_input.return_value = {"kind": "add_player:menu", "prompt_message_id": 42}
+        update = self._make_update("Вова", reply_to_message_id=999)
+        await self.handlers._handle_pending_text(update)
+        self.storage.add_guest_player.assert_not_called()
+
+    async def test_reply_to_correct_prompt_adds_player(self) -> None:
+        self.storage.get_pending_input.return_value = {"kind": "add_player:menu", "prompt_message_id": 42}
+        self.storage.list_players.return_value = []
+        update = self._make_update("Вова", reply_to_message_id=42)
+        await self.handlers._handle_pending_text(update)
+        self.storage.add_guest_player.assert_called_once()
+        self.storage.clear_pending_input.assert_called_once_with(chat_id=100, user_id=1)
 
 
 if __name__ == "__main__":

@@ -182,9 +182,16 @@ class BotHandlers:
         chat = update.effective_chat
         if message is None or user is None or chat is None:
             return
-        kind = self.storage.pop_pending_input(chat_id=chat.id, user_id=user.id)
-        if kind is None:
+        pending = self.storage.get_pending_input(chat_id=chat.id, user_id=user.id)
+        if pending is None:
             return
+        # Only treat this as an answer if it's a reply to our own prompt —
+        # otherwise any unrelated chat message would get silently hijacked.
+        reply_to_id = message.reply_to_message.message_id if message.reply_to_message else None
+        if reply_to_id != pending["prompt_message_id"]:
+            return
+        self.storage.clear_pending_input(chat_id=chat.id, user_id=user.id)
+        kind = pending["kind"]
 
         if kind == "tn_name":
             draft = self.storage.get_setup_draft(chat.id)
@@ -536,8 +543,13 @@ class BotHandlers:
                 text, kb = self._render_wizard_step(draft, chat_id)
                 await query.edit_message_text(text, reply_markup=kb)
             else:
-                self.storage.set_pending_input(chat_id=chat_id, user_id=query.from_user.id, kind="tn_name")
-                await query.answer("Напиши название одним сообщением в чат.", show_alert=True)
+                await query.answer()
+                prompt = await query.message.reply_text(
+                    "Напиши название турнира ответом (reply) на это сообщение.", do_quote=False
+                )
+                self.storage.set_pending_input(
+                    chat_id=chat_id, user_id=query.from_user.id, kind="tn_name", prompt_message_id=prompt.message_id
+                )
             return
 
         if action == "game":
@@ -1107,10 +1119,16 @@ class BotHandlers:
 
     async def _handle_add_player_callback(self, query, chat_id: int, parts: list[str]) -> None:
         origin = parts[1]
-        self.storage.set_pending_input(chat_id=chat_id, user_id=query.from_user.id, kind=f"add_player:{origin}")
-        await query.answer(
-            "Напиши имя одним сообщением в чат. Можно сразу несколько имён через пробел.",
-            show_alert=True,
+        await query.answer()
+        prompt = await query.message.reply_text(
+            "Напиши имя ответом (reply) на это сообщение. Можно сразу несколько через пробел.",
+            do_quote=False,
+        )
+        self.storage.set_pending_input(
+            chat_id=chat_id,
+            user_id=query.from_user.id,
+            kind=f"add_player:{origin}",
+            prompt_message_id=prompt.message_id,
         )
 
     # -- settings ------------------------------------------------------

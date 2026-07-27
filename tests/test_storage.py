@@ -192,12 +192,15 @@ class StorageTests(unittest.TestCase):
         self.assertEqual({p.user_id for p in players_chat1}, {1, 2, 3})
         self.assertEqual({p.user_id for p in players_chat2}, {1})
 
-    def test_pending_input_roundtrip_and_expiry(self) -> None:
-        self.storage.set_pending_input(chat_id=CHAT, user_id=1, kind="tn_name")
-        kind = self.storage.pop_pending_input(chat_id=CHAT, user_id=1)
-        self.assertEqual(kind, "tn_name")
-        # popped once, gone now
-        self.assertIsNone(self.storage.pop_pending_input(chat_id=CHAT, user_id=1))
+    def test_pending_input_roundtrip_and_clear(self) -> None:
+        self.storage.set_pending_input(chat_id=CHAT, user_id=1, kind="tn_name", prompt_message_id=555)
+        pending = self.storage.get_pending_input(chat_id=CHAT, user_id=1)
+        self.assertEqual(pending["kind"], "tn_name")
+        self.assertEqual(pending["prompt_message_id"], 555)
+        # still there until explicitly cleared (caller checks reply-to before clearing)
+        self.assertIsNotNone(self.storage.get_pending_input(chat_id=CHAT, user_id=1))
+        self.storage.clear_pending_input(chat_id=CHAT, user_id=1)
+        self.assertIsNone(self.storage.get_pending_input(chat_id=CHAT, user_id=1))
 
     def test_settings_default_enabled_and_toggle(self) -> None:
         self.assertTrue(self.storage.get_setting(CHAT, "quips"))

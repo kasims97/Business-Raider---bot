@@ -115,11 +115,18 @@ class Storage:
                     chat_id INTEGER NOT NULL,
                     user_id INTEGER NOT NULL,
                     kind TEXT NOT NULL,
+                    prompt_message_id INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (chat_id, user_id)
                 );
                 """
             )
+            self._ensure_pending_input_columns(conn)
+
+    def _ensure_pending_input_columns(self, conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(pending_input)").fetchall()}
+        if "prompt_message_id" not in columns:
+            conn.execute("ALTER TABLE pending_input ADD COLUMN prompt_message_id INTEGER")
 
     # -- users / presence -------------------------------------------------
 
@@ -173,32 +180,40 @@ class Storage:
 
     # -- pending text input -------------------------------------------------
 
-    def set_pending_input(self, *, chat_id: int, user_id: int, kind: str) -> None:
+    def set_pending_input(self, *, chat_id: int, user_id: int, kind: str, prompt_message_id: int) -> None:
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO pending_input (chat_id, user_id, kind, created_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(chat_id, user_id) DO UPDATE SET kind = excluded.kind, created_at = excluded.created_at
+                INSERT INTO pending_input (chat_id, user_id, kind, prompt_message_id, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                    kind = excluded.kind,
+                    prompt_message_id = excluded.prompt_message_id,
+                    created_at = excluded.created_at
                 """,
-                (chat_id, user_id, kind, datetime.now(timezone.utc).isoformat()),
+                (chat_id, user_id, kind, prompt_message_id, datetime.now(timezone.utc).isoformat()),
             )
 
-    def pop_pending_input(self, *, chat_id: int, user_id: int) -> str | None:
+    def get_pending_input(self, *, chat_id: int, user_id: int) -> sqlite3.Row | None:
+        """Only meaningful if the incoming message replies to `prompt_message_id` —
+        callers must not treat an ordinary chat message as an answer."""
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT kind, created_at FROM pending_input WHERE chat_id = ? AND user_id = ?",
+                "SELECT kind, prompt_message_id, created_at FROM pending_input WHERE chat_id = ? AND user_id = ?",
                 (chat_id, user_id),
             ).fetchone()
-            if row is None:
-                return None
-            conn.execute(
-                "DELETE FROM pending_input WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
-            )
+        if row is None:
+            return None
         created_at = datetime.fromisoformat(row["created_at"])
         if datetime.now(timezone.utc) - created_at > PENDING_INPUT_TTL:
             return None
-        return row["kind"]
+        return row
+
+    def clear_pending_input(self, *, chat_id: int, user_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM pending_input WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+            )
 
     # -- tournament setup ----------------------------------------------------
 
