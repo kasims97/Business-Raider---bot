@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import sqlite3
+from collections import Counter
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterator
 
-from bot.rating import UserWeekStats, week_key
+from bot.stats import PlayerTotals, merge_totals
+
+PENDING_INPUT_TTL = timedelta(minutes=10)
 
 
 class Storage:
@@ -37,84 +40,9 @@ class Storage:
                     is_bot INTEGER NOT NULL DEFAULT 0
                 );
 
-                CREATE TABLE IF NOT EXISTS activity (
-                    user_id INTEGER NOT NULL,
-                    date TEXT NOT NULL,
-                    messages INTEGER NOT NULL DEFAULT 0,
-                    reactions_received INTEGER NOT NULL DEFAULT 0,
-                    reactions_given INTEGER NOT NULL DEFAULT 0,
-                    mentions INTEGER NOT NULL DEFAULT 0,
-                    forwards_public INTEGER NOT NULL DEFAULT 0,
-                    video_notes INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (user_id, date),
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS activity_by_chat (
-                    chat_id INTEGER NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    date TEXT NOT NULL,
-                    messages INTEGER NOT NULL DEFAULT 0,
-                    reactions_received INTEGER NOT NULL DEFAULT 0,
-                    reactions_given INTEGER NOT NULL DEFAULT 0,
-                    mentions INTEGER NOT NULL DEFAULT 0,
-                    forwards_public INTEGER NOT NULL DEFAULT 0,
-                    video_notes INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (chat_id, user_id, date),
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS titles (
-                    user_id INTEGER NOT NULL,
-                    week TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    PRIMARY KEY (week, title),
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS titles_by_chat (
-                    chat_id INTEGER NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    week TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    PRIMARY KEY (chat_id, week, title),
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS message_stats (
-                    chat_id INTEGER NOT NULL,
-                    message_id INTEGER NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    message_date TEXT NOT NULL,
-                    reactions_received INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (chat_id, message_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS weekly_reports (
-                    week TEXT PRIMARY KEY,
-                    posted_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS weekly_reports_by_chat (
-                    chat_id INTEGER NOT NULL,
-                    week TEXT NOT NULL,
-                    posted_at TEXT NOT NULL,
-                    PRIMARY KEY (chat_id, week)
-                );
-
                 CREATE TABLE IF NOT EXISTS bot_state (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS rep_votes (
-                    chat_id INTEGER NOT NULL,
-                    week TEXT NOT NULL,
-                    from_user_id INTEGER NOT NULL,
-                    to_user_id INTEGER NOT NULL,
-                    value INTEGER NOT NULL CHECK(value IN (-1, 1)),
-                    voted_at TEXT NOT NULL,
-                    PRIMARY KEY (chat_id, week, from_user_id, to_user_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS chat_members (
@@ -125,597 +53,665 @@ class Storage:
                     PRIMARY KEY (chat_id, user_id)
                 );
 
-                CREATE TABLE IF NOT EXISTS message_content (
+                CREATE TABLE IF NOT EXISTS tournaments (
+                    tournament_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id INTEGER NOT NULL,
-                    message_id INTEGER NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    game TEXT,
+                    team_mode INTEGER,
+                    status TEXT NOT NULL DEFAULT 'setup',
+                    created_by INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS tournament_players (
+                    tournament_id INTEGER NOT NULL,
                     user_id INTEGER NOT NULL,
-                    message_date TEXT NOT NULL,
-                    message_type TEXT NOT NULL,
-                    text_content TEXT,
-                    reply_to_message_id INTEGER,
-                    file_id TEXT,
-                    transcript_text TEXT,
-                    transcript_source TEXT NOT NULL DEFAULT 'none',
-                    transcript_status TEXT NOT NULL DEFAULT 'not_needed',
-                    PRIMARY KEY (chat_id, message_id)
+                    team INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (tournament_id, user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS matches (
+                    match_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tournament_id INTEGER NOT NULL,
+                    match_no INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'live',
+                    created_at TEXT NOT NULL,
+                    winner_team INTEGER
+                );
+
+                CREATE TABLE IF NOT EXISTS match_players (
+                    match_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    team INTEGER NOT NULL DEFAULT 0,
+                    top INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (match_id, user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS kills (
+                    kill_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    match_id INTEGER NOT NULL,
+                    killer_id INTEGER NOT NULL,
+                    victim_id INTEGER,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS predictions (
+                    tournament_id INTEGER NOT NULL,
+                    voter_id INTEGER NOT NULL,
+                    pick_user_id INTEGER NOT NULL,
+                    PRIMARY KEY (tournament_id, voter_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS mvp_votes (
+                    tournament_id INTEGER NOT NULL,
+                    voter_id INTEGER NOT NULL,
+                    pick_user_id INTEGER NOT NULL,
+                    PRIMARY KEY (tournament_id, voter_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS pending_input (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, user_id)
                 );
                 """
             )
-            self._ensure_users_columns(conn)
-            self._migrate_single_chat_data(conn)
 
-    def upsert_user(
-        self,
-        user_id: int,
-        username: str | None,
-        first_name: str,
-        is_bot: bool = False,
-    ) -> None:
+    # -- users / presence -------------------------------------------------
+
+    def upsert_user(self, user_id: int, username: str | None, first_name: str, is_bot: bool = False) -> None:
         with self.connect() as conn:
             self._upsert_user(conn, user_id, username, first_name, is_bot)
 
     def register_chat_presence(
-        self,
-        *,
-        chat_id: int,
-        user_id: int,
-        username: str | None,
-        first_name: str,
-        is_bot: bool,
-        seen_at: date,
+        self, *, chat_id: int, user_id: int, username: str | None, first_name: str, is_bot: bool, seen_at: date
     ) -> None:
+        if is_bot:
+            return
         with self.connect() as conn:
             self._upsert_user(conn, user_id, username, first_name, is_bot)
             self._touch_chat_member(conn, chat_id, user_id, seen_at.isoformat())
 
-    def record_message(
-        self,
-        *,
-        chat_id: int,
-        message_id: int,
-        user_id: int,
-        username: str | None,
-        first_name: str,
-        is_bot: bool,
-        day: date,
-        is_forward_public: bool,
-        is_video_note: bool,
-    ) -> None:
-        with self.connect() as conn:
-            self._upsert_user(conn, user_id, username, first_name, is_bot)
-            self._touch_chat_member(conn, chat_id, user_id, day.isoformat())
-            self._ensure_activity_row(conn, chat_id, user_id, day.isoformat())
-            conn.execute(
-                """
-                UPDATE activity_by_chat
-                SET messages = messages + 1,
-                    forwards_public = forwards_public + ?,
-                    video_notes = video_notes + ?
-                WHERE chat_id = ? AND user_id = ? AND date = ?
-                """,
-                (
-                    1 if is_forward_public else 0,
-                    1 if is_video_note else 0,
-                    chat_id,
-                    user_id,
-                    day.isoformat(),
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO message_stats (chat_id, message_id, user_id, message_date, reactions_received)
-                VALUES (?, ?, ?, ?, 0)
-                ON CONFLICT(chat_id, message_id) DO NOTHING
-                """,
-                (chat_id, message_id, user_id, day.isoformat()),
-            )
-
-    def save_message_content(
-        self,
-        *,
-        chat_id: int,
-        message_id: int,
-        user_id: int,
-        message_date: date,
-        message_type: str,
-        text_content: str | None,
-        reply_to_message_id: int | None,
-        file_id: str | None,
-        transcript_status: str,
-    ) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO message_content (
-                    chat_id, message_id, user_id, message_date, message_type,
-                    text_content, reply_to_message_id, file_id, transcript_status
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(chat_id, message_id) DO UPDATE SET
-                    user_id = excluded.user_id,
-                    message_date = excluded.message_date,
-                    message_type = excluded.message_type,
-                    text_content = excluded.text_content,
-                    reply_to_message_id = excluded.reply_to_message_id,
-                    file_id = excluded.file_id,
-                    transcript_status = excluded.transcript_status
-                """,
-                (
-                    chat_id,
-                    message_id,
-                    user_id,
-                    message_date.isoformat(),
-                    message_type,
-                    text_content,
-                    reply_to_message_id,
-                    file_id,
-                    transcript_status,
-                ),
-            )
-
-    def save_salute_transcript(
-        self,
-        *,
-        chat_id: int,
-        reply_to_message_id: int,
-        transcript_text: str,
-    ) -> bool:
-        if not transcript_text.strip():
-            return False
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT 1
-                FROM message_content
-                WHERE chat_id = ?
-                  AND message_id = ?
-                  AND message_type IN ('voice', 'video_note')
-                """,
-                (chat_id, reply_to_message_id),
-            ).fetchone()
-            if row is None:
-                return False
-            conn.execute(
-                """
-                UPDATE message_content
-                SET transcript_text = ?,
-                    transcript_source = 'salute',
-                    transcript_status = 'done'
-                WHERE chat_id = ? AND message_id = ?
-                """,
-                (transcript_text.strip(), chat_id, reply_to_message_id),
-            )
-            return True
-
-    def get_recent_message_content(self, *, chat_id: int, limit: int = 100) -> list[sqlite3.Row]:
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT mc.*, u.username, u.first_name, u.is_bot
-                FROM message_content mc
-                JOIN users u ON u.user_id = mc.user_id
-                WHERE mc.chat_id = ?
-                ORDER BY mc.message_date DESC, mc.message_id DESC
-                LIMIT ?
-                """,
-                (chat_id, limit),
-            ).fetchall()
-        return list(reversed(rows))
-
-    def increment_mentions(self, *, chat_id: int, user_ids: list[int], day: date) -> None:
-        if not user_ids:
-            return
-        with self.connect() as conn:
-            for user_id in user_ids:
-                self._touch_chat_member(conn, chat_id, user_id, day.isoformat())
-                self._ensure_activity_row(conn, chat_id, user_id, day.isoformat())
-                conn.execute(
-                    """
-                    UPDATE activity_by_chat
-                    SET mentions = mentions + 1
-                    WHERE chat_id = ? AND user_id = ? AND date = ?
-                    """,
-                    (chat_id, user_id, day.isoformat()),
-                )
-
-    def increment_reactions_given(
-        self,
-        *,
-        chat_id: int,
-        user_id: int,
-        username: str | None,
-        first_name: str,
-        is_bot: bool,
-        day: date,
-        delta: int,
-    ) -> None:
-        if delta == 0:
-            return
-        with self.connect() as conn:
-            self._upsert_user(conn, user_id, username, first_name, is_bot)
-            self._touch_chat_member(conn, chat_id, user_id, day.isoformat())
-            self._ensure_activity_row(conn, chat_id, user_id, day.isoformat())
-            conn.execute(
-                """
-                UPDATE activity_by_chat
-                SET reactions_given = reactions_given + ?
-                WHERE chat_id = ? AND user_id = ? AND date = ?
-                """,
-                (delta, chat_id, user_id, day.isoformat()),
-            )
-
-    def apply_reaction_delta(
-        self,
-        *,
-        chat_id: int,
-        message_id: int,
-        day: date,
-        delta: int,
-    ) -> bool:
-        if delta == 0:
-            return False
-
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT user_id
-                FROM message_stats
-                WHERE chat_id = ? AND message_id = ?
-                """,
-                (chat_id, message_id),
-            ).fetchone()
-            if row is None:
-                return False
-
-            self._touch_chat_member(conn, chat_id, row["user_id"], day.isoformat())
-            self._ensure_activity_row(conn, chat_id, row["user_id"], day.isoformat())
-            conn.execute(
-                """
-                UPDATE activity_by_chat
-                SET reactions_received = reactions_received + ?
-                WHERE chat_id = ? AND user_id = ? AND date = ?
-                """,
-                (delta, chat_id, row["user_id"], day.isoformat()),
-            )
-            conn.execute(
-                """
-                UPDATE message_stats
-                SET reactions_received = reactions_received + ?
-                WHERE chat_id = ? AND message_id = ?
-                """,
-                (delta, chat_id, message_id),
-            )
-            return True
-
-    def find_user_ids_by_usernames(self, usernames: list[str]) -> dict[str, int]:
-        if not usernames:
-            return {}
-
-        placeholders = ",".join("?" for _ in usernames)
-        with self.connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT user_id, username
-                FROM users
-                WHERE username IN ({placeholders})
-                """,
-                usernames,
-            ).fetchall()
-        return {row["username"]: row["user_id"] for row in rows if row["username"]}
-
-    def get_week_stats(self, chat_id: int, week_start: date) -> list[UserWeekStats]:
-        start = week_start.isoformat()
-        end = (week_start + timedelta(days=6)).isoformat()
-        week = week_key(week_start)
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT
-                    u.user_id,
-                    u.username,
-                    u.first_name,
-                    COALESCE(a.messages, 0) AS messages,
-                    COALESCE(a.reactions_received, 0) AS reactions_received,
-                    COALESCE(a.reactions_given, 0) AS reactions_given,
-                    COALESCE(a.mentions, 0) AS mentions,
-                    COALESCE(a.forwards_public, 0) AS forwards_public,
-                    COALESCE(a.video_notes, 0) AS video_notes,
-                    COALESCE(r.rep_plus, 0) AS rep_plus,
-                    COALESCE(r.rep_minus, 0) AS rep_minus
-                FROM chat_members cm
-                JOIN users u ON u.user_id = cm.user_id
-                LEFT JOIN (
-                    SELECT
-                        chat_id,
-                        user_id,
-                        SUM(messages) AS messages,
-                        SUM(reactions_received) AS reactions_received,
-                        SUM(reactions_given) AS reactions_given,
-                        SUM(mentions) AS mentions,
-                        SUM(forwards_public) AS forwards_public,
-                        SUM(video_notes) AS video_notes
-                    FROM activity_by_chat
-                    WHERE chat_id = ? AND date BETWEEN ? AND ?
-                    GROUP BY chat_id, user_id
-                ) a ON a.chat_id = cm.chat_id AND a.user_id = cm.user_id
-                LEFT JOIN (
-                    SELECT
-                        chat_id,
-                        to_user_id AS user_id,
-                        SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END) AS rep_plus,
-                        SUM(CASE WHEN value = -1 THEN 1 ELSE 0 END) AS rep_minus
-                    FROM rep_votes
-                    WHERE chat_id = ? AND week = ?
-                    GROUP BY chat_id, to_user_id
-                ) r ON r.chat_id = cm.chat_id AND r.user_id = cm.user_id
-                WHERE cm.chat_id = ?
-                ORDER BY u.user_id
-                """,
-                (chat_id, start, end, chat_id, week, chat_id),
-            ).fetchall()
-        stats = [
-            UserWeekStats(
-                user_id=row["user_id"],
-                username=row["username"],
-                first_name=row["first_name"],
-                messages=row["messages"],
-                reactions_received=row["reactions_received"],
-                reactions_given=row["reactions_given"],
-                mentions=row["mentions"],
-                forwards_public=row["forwards_public"],
-                video_notes=row["video_notes"],
-                rep_plus=row["rep_plus"],
-                rep_minus=row["rep_minus"],
-            )
-            for row in rows
-        ]
-        return [item for item in stats if self._has_week_activity(item)]
-
-    def list_rep_candidates(self, *, chat_id: int, exclude_user_id: int) -> list[SimpleNamespace]:
+    def list_players(self, chat_id: int) -> list[SimpleNamespace]:
         with self.connect() as conn:
             rows = conn.execute(
                 """
                 SELECT u.user_id, u.username, u.first_name
                 FROM chat_members cm
                 JOIN users u ON u.user_id = cm.user_id
-                WHERE cm.chat_id = ?
-                  AND u.user_id != ?
-                  AND u.is_bot = 0
+                WHERE cm.chat_id = ? AND u.is_bot = 0
                 ORDER BY
                     CASE WHEN username IS NULL OR username = '' THEN 1 ELSE 0 END,
-                    LOWER(COALESCE(username, first_name)),
+                    LOWER(COALESCE(u.username, u.first_name)),
                     u.user_id
                 """,
-                (chat_id, exclude_user_id),
+                (chat_id,),
             ).fetchall()
-            if not rows:
-                rows = conn.execute(
-                    """
-                    SELECT u.user_id, u.username, u.first_name
-                    FROM users u
-                    WHERE u.user_id != ?
-                      AND u.is_bot = 0
-                    ORDER BY
-                        CASE WHEN username IS NULL OR username = '' THEN 1 ELSE 0 END,
-                        LOWER(COALESCE(username, first_name)),
-                        u.user_id
-                    """,
-                    (exclude_user_id,),
-                ).fetchall()
-                for row in rows:
-                    self._touch_chat_member(conn, chat_id, row["user_id"], date.today().isoformat())
         return [
-            SimpleNamespace(
-                user_id=row["user_id"],
-                username=row["username"],
-                first_name=row["first_name"],
-            )
-            for row in rows
+            SimpleNamespace(user_id=r["user_id"], username=r["username"], first_name=r["first_name"])
+            for r in rows
         ]
 
-    def apply_rep_vote(
-        self,
-        *,
-        chat_id: int,
-        week_start: date,
-        from_user_id: int,
-        from_username: str | None,
-        from_first_name: str,
-        from_is_bot: bool,
-        to_user_id: int,
-        to_username: str | None,
-        to_first_name: str,
-        to_is_bot: bool,
-        value: int,
-        voted_at: datetime,
-    ) -> str:
-        week = week_key(week_start)
+    def add_guest_player(self, *, chat_id: int, first_name: str, seen_at: date) -> int:
         with self.connect() as conn:
-            self._upsert_user(
-                conn, from_user_id, from_username, from_first_name, from_is_bot
-            )
-            self._upsert_user(conn, to_user_id, to_username, to_first_name, to_is_bot)
-            self._touch_chat_member(conn, chat_id, from_user_id, voted_at.date().isoformat())
-            self._touch_chat_member(conn, chat_id, to_user_id, voted_at.date().isoformat())
-            row = conn.execute(
-                """
-                SELECT value
-                FROM rep_votes
-                WHERE chat_id = ? AND week = ? AND from_user_id = ? AND to_user_id = ?
-                """,
-                (chat_id, week, from_user_id, to_user_id),
-            ).fetchone()
-            if row is not None and row["value"] == value:
-                return "unchanged"
+            row = conn.execute("SELECT MIN(user_id) AS min_id FROM users WHERE user_id < 0").fetchone()
+            next_id = (row["min_id"] - 1) if row and row["min_id"] is not None else -1
+            self._upsert_user(conn, next_id, None, first_name, False)
+            self._touch_chat_member(conn, chat_id, next_id, seen_at.isoformat())
+        return next_id
 
+    def remove_player(self, *, chat_id: int, user_id: int) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM chat_members WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+            )
+            return cur.rowcount > 0
+
+    # -- pending text input -------------------------------------------------
+
+    def set_pending_input(self, *, chat_id: int, user_id: int, kind: str) -> None:
+        with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO rep_votes (chat_id, week, from_user_id, to_user_id, value, voted_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(chat_id, week, from_user_id, to_user_id) DO UPDATE SET
-                    value = excluded.value,
-                    voted_at = excluded.voted_at
+                INSERT INTO pending_input (chat_id, user_id, kind, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET kind = excluded.kind, created_at = excluded.created_at
                 """,
-                (
-                    chat_id,
-                    week,
-                    from_user_id,
-                    to_user_id,
-                    value,
-                    voted_at.isoformat(),
-                ),
+                (chat_id, user_id, kind, datetime.now(timezone.utc).isoformat()),
             )
-            return "created" if row is None else "flipped"
 
-    def save_titles(
-        self,
-        chat_id: int,
-        week_start: date,
-        title_pairs: list[tuple[int, str]],
-    ) -> None:
-        week = week_key(week_start)
+    def pop_pending_input(self, *, chat_id: int, user_id: int) -> str | None:
         with self.connect() as conn:
-            for user_id, title in title_pairs:
+            row = conn.execute(
+                "SELECT kind, created_at FROM pending_input WHERE chat_id = ? AND user_id = ?",
+                (chat_id, user_id),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                "DELETE FROM pending_input WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+            )
+        created_at = datetime.fromisoformat(row["created_at"])
+        if datetime.now(timezone.utc) - created_at > PENDING_INPUT_TTL:
+            return None
+        return row["kind"]
+
+    # -- tournament setup ----------------------------------------------------
+
+    def get_setup_draft(self, chat_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM tournaments WHERE chat_id = ? AND status = 'setup'", (chat_id,)
+            ).fetchone()
+
+    def get_active_tournament(self, chat_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM tournaments WHERE chat_id = ? AND status = 'active'", (chat_id,)
+            ).fetchone()
+
+    def get_tournament(self, tournament_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM tournaments WHERE tournament_id = ?", (tournament_id,)
+            ).fetchone()
+
+    def create_setup_draft(self, *, chat_id: int, created_by: int) -> int:
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT tournament_id FROM tournaments WHERE chat_id = ? AND status = 'setup'",
+                (chat_id,),
+            ).fetchone()
+            if existing:
+                return existing["tournament_id"]
+            cur = conn.execute(
+                """
+                INSERT INTO tournaments (chat_id, name, status, created_by, created_at)
+                VALUES (?, '', 'setup', ?, ?)
+                """,
+                (chat_id, created_by, datetime.now(timezone.utc).isoformat()),
+            )
+            return cur.lastrowid
+
+    def set_draft_name(self, tournament_id: int, name: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE tournaments SET name = ? WHERE tournament_id = ?", (name, tournament_id)
+            )
+
+    def set_draft_game(self, tournament_id: int, game: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE tournaments SET game = ? WHERE tournament_id = ?", (game, tournament_id)
+            )
+
+    def set_draft_mode(self, tournament_id: int, team_mode: bool) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE tournaments SET team_mode = ? WHERE tournament_id = ?",
+                (int(team_mode), tournament_id),
+            )
+
+    def toggle_draft_player(self, tournament_id: int, user_id: int, team_mode: bool) -> None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT team FROM tournament_players WHERE tournament_id = ? AND user_id = ?",
+                (tournament_id, user_id),
+            ).fetchone()
+            if not team_mode:
+                if row is None:
+                    conn.execute(
+                        "INSERT INTO tournament_players (tournament_id, user_id, team) VALUES (?, ?, 0)",
+                        (tournament_id, user_id),
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM tournament_players WHERE tournament_id = ? AND user_id = ?",
+                        (tournament_id, user_id),
+                    )
+                return
+
+            if row is None:
                 conn.execute(
-                    """
-                    INSERT OR REPLACE INTO titles_by_chat (chat_id, user_id, week, title)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (chat_id, user_id, week, title),
+                    "INSERT INTO tournament_players (tournament_id, user_id, team) VALUES (?, ?, 1)",
+                    (tournament_id, user_id),
+                )
+            elif row["team"] == 1:
+                conn.execute(
+                    "UPDATE tournament_players SET team = 2 WHERE tournament_id = ? AND user_id = ?",
+                    (tournament_id, user_id),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM tournament_players WHERE tournament_id = ? AND user_id = ?",
+                    (tournament_id, user_id),
                 )
 
-    def get_titles_for_user(self, chat_id: int, week_start: date, user_id: int) -> list[str]:
-        week = week_key(week_start)
+    def get_draft_players(self, tournament_id: int) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                """
+                SELECT tp.user_id, tp.team, u.first_name, u.username
+                FROM tournament_players tp
+                JOIN users u ON u.user_id = tp.user_id
+                WHERE tp.tournament_id = ?
+                ORDER BY u.first_name
+                """,
+                (tournament_id,),
+            ).fetchall()
+
+    def cancel_draft(self, tournament_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM tournament_players WHERE tournament_id = ?", (tournament_id,))
+            conn.execute("DELETE FROM tournaments WHERE tournament_id = ?", (tournament_id,))
+
+    def start_tournament(self, tournament_id: int) -> int:
+        """Activates the draft and opens match #1. Returns the new match_id."""
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE tournaments SET status = 'active' WHERE tournament_id = ?", (tournament_id,)
+            )
+            return self._open_next_match(conn, tournament_id)
+
+    # -- live match ------------------------------------------------------
+
+    def get_live_match(self, tournament_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM matches WHERE tournament_id = ? AND status = 'live'",
+                (tournament_id,),
+            ).fetchone()
+
+    def get_match(self, match_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM matches WHERE match_id = ?", (match_id,)).fetchone()
+
+    def get_match_players(self, match_id: int) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                """
+                SELECT mp.user_id, mp.team, mp.top, u.first_name, u.username,
+                       COALESCE((SELECT COUNT(*) FROM kills k WHERE k.match_id = mp.match_id AND k.killer_id = mp.user_id), 0) AS kills
+                FROM match_players mp
+                JOIN users u ON u.user_id = mp.user_id
+                WHERE mp.match_id = ?
+                ORDER BY u.first_name
+                """,
+                (match_id,),
+            ).fetchall()
+
+    def toggle_match_roster(self, match_id: int, user_id: int, team_mode: bool) -> None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT team FROM match_players WHERE match_id = ? AND user_id = ?",
+                (match_id, user_id),
+            ).fetchone()
+            if not team_mode:
+                if row is None:
+                    conn.execute(
+                        "INSERT INTO match_players (match_id, user_id, team, top) VALUES (?, ?, 0, 0)",
+                        (match_id, user_id),
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM match_players WHERE match_id = ? AND user_id = ?",
+                        (match_id, user_id),
+                    )
+                return
+
+            if row is None:
+                conn.execute(
+                    "INSERT INTO match_players (match_id, user_id, team, top) VALUES (?, ?, 1, 0)",
+                    (match_id, user_id),
+                )
+            elif row["team"] == 1:
+                conn.execute(
+                    "UPDATE match_players SET team = 2 WHERE match_id = ? AND user_id = ?",
+                    (match_id, user_id),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM match_players WHERE match_id = ? AND user_id = ?",
+                    (match_id, user_id),
+                )
+
+    def record_kill(self, *, match_id: int, killer_id: int, victim_id: int | None) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO kills (match_id, killer_id, victim_id, created_at) VALUES (?, ?, ?, ?)",
+                (match_id, killer_id, victim_id, datetime.now(timezone.utc).isoformat()),
+            )
+
+    def undo_last_kill(self, *, match_id: int, killer_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT kill_id FROM kills
+                WHERE match_id = ? AND killer_id = ?
+                ORDER BY kill_id DESC LIMIT 1
+                """,
+                (match_id, killer_id),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute("DELETE FROM kills WHERE kill_id = ?", (row["kill_id"],))
+            return True
+
+    def toggle_top(self, *, match_id: int, user_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE match_players SET top = 1 - top WHERE match_id = ? AND user_id = ?",
+                (match_id, user_id),
+            )
+
+    def set_winner_team(self, *, match_id: int, team: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE matches SET winner_team = ? WHERE match_id = ?", (team, match_id)
+            )
+
+    def save_match_and_advance(self, *, tournament_id: int, match_id: int) -> int:
+        """Marks the match saved, syncs the roster, opens the next match. Returns new match_id."""
+        with self.connect() as conn:
+            conn.execute("UPDATE matches SET status = 'saved' WHERE match_id = ?", (match_id,))
+            conn.execute("DELETE FROM tournament_players WHERE tournament_id = ?", (tournament_id,))
+            conn.execute(
+                """
+                INSERT INTO tournament_players (tournament_id, user_id, team)
+                SELECT ?, user_id, team FROM match_players WHERE match_id = ?
+                """,
+                (tournament_id, match_id),
+            )
+            return self._open_next_match(conn, tournament_id)
+
+    def undo_last_saved_match(self, tournament_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT match_id FROM matches
+                WHERE tournament_id = ? AND status = 'saved'
+                ORDER BY match_no DESC LIMIT 1
+                """,
+                (tournament_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            match_id = row["match_id"]
+            conn.execute("DELETE FROM kills WHERE match_id = ?", (match_id,))
+            conn.execute("DELETE FROM match_players WHERE match_id = ?", (match_id,))
+            conn.execute("DELETE FROM matches WHERE match_id = ?", (match_id,))
+            return True
+
+    def finish_tournament(self, tournament_id: int) -> None:
+        with self.connect() as conn:
+            live = conn.execute(
+                "SELECT match_id FROM matches WHERE tournament_id = ? AND status = 'live'",
+                (tournament_id,),
+            ).fetchone()
+            if live is not None:
+                conn.execute("DELETE FROM kills WHERE match_id = ?", (live["match_id"],))
+                conn.execute("DELETE FROM match_players WHERE match_id = ?", (live["match_id"],))
+                conn.execute("DELETE FROM matches WHERE match_id = ?", (live["match_id"],))
+            conn.execute(
+                "UPDATE tournaments SET status = 'finished', finished_at = ? WHERE tournament_id = ?",
+                (datetime.now(timezone.utc).isoformat(), tournament_id),
+            )
+
+    def _open_next_match(self, conn: sqlite3.Connection, tournament_id: int) -> int:
+        last_no = conn.execute(
+            "SELECT COALESCE(MAX(match_no), 0) AS n FROM matches WHERE tournament_id = ?",
+            (tournament_id,),
+        ).fetchone()["n"]
+        cur = conn.execute(
+            """
+            INSERT INTO matches (tournament_id, match_no, status, created_at)
+            VALUES (?, ?, 'live', ?)
+            """,
+            (tournament_id, last_no + 1, datetime.now(timezone.utc).isoformat()),
+        )
+        match_id = cur.lastrowid
+        conn.execute(
+            """
+            INSERT INTO match_players (match_id, user_id, team, top)
+            SELECT ?, user_id, team, 0 FROM tournament_players WHERE tournament_id = ?
+            """,
+            (match_id, tournament_id),
+        )
+        return match_id
+
+    # -- aggregation -------------------------------------------------------
+
+    def get_tournament_totals(self, tournament_id: int) -> list[PlayerTotals]:
+        with self.connect() as conn:
+            matches = conn.execute(
+                "SELECT match_id, winner_team FROM matches WHERE tournament_id = ? AND status = 'saved'",
+                (tournament_id,),
+            ).fetchall()
+            match_ids = [m["match_id"] for m in matches]
+            if not match_ids:
+                return []
+            winner_by_match = {m["match_id"]: m["winner_team"] for m in matches}
+            placeholders = ",".join("?" for _ in match_ids)
+            mp_rows = conn.execute(
+                f"SELECT match_id, user_id, team, top FROM match_players WHERE match_id IN ({placeholders})",
+                match_ids,
+            ).fetchall()
+            kill_rows = conn.execute(
+                f"SELECT killer_id, COUNT(*) AS c FROM kills WHERE match_id IN ({placeholders}) GROUP BY killer_id",
+                match_ids,
+            ).fetchall()
+            users = {
+                u["user_id"]: u for u in conn.execute("SELECT user_id, username, first_name FROM users").fetchall()
+            }
+
+        kills_by_user = {r["killer_id"]: r["c"] for r in kill_rows}
+        played: Counter[int] = Counter()
+        tops: Counter[int] = Counter()
+        for row in mp_rows:
+            played[row["user_id"]] += 1
+            if row["team"] in (1, 2):
+                won = row["team"] == winner_by_match[row["match_id"]]
+            else:
+                won = row["top"] == 1
+            if won:
+                tops[row["user_id"]] += 1
+
+        totals = []
+        for user_id in played:
+            user = users.get(user_id)
+            if user is None:
+                continue
+            totals.append(
+                PlayerTotals(
+                    user_id=user_id,
+                    username=user["username"],
+                    first_name=user["first_name"],
+                    played=played[user_id],
+                    kills=kills_by_user.get(user_id, 0),
+                    tops=tops[user_id],
+                )
+            )
+        return totals
+
+    def get_match_kills(self, match_id: int) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                """
+                SELECT k.killer_id, ku.first_name AS killer_name,
+                       k.victim_id, vu.first_name AS victim_name
+                FROM kills k
+                JOIN users ku ON ku.user_id = k.killer_id
+                LEFT JOIN users vu ON vu.user_id = k.victim_id
+                WHERE k.match_id = ?
+                ORDER BY k.kill_id
+                """,
+                (match_id,),
+            ).fetchall()
+
+    def get_kill_matrix(self, tournament_id: int) -> dict[tuple[int, int], int]:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT title
-                FROM titles_by_chat
-                WHERE chat_id = ? AND week = ? AND user_id = ?
-                ORDER BY title
+                SELECT k.killer_id, k.victim_id, COUNT(*) AS c
+                FROM kills k
+                JOIN matches m ON m.match_id = k.match_id
+                WHERE m.tournament_id = ? AND m.status = 'saved' AND k.victim_id IS NOT NULL
+                GROUP BY k.killer_id, k.victim_id
                 """,
-                (chat_id, week, user_id),
+                (tournament_id,),
             ).fetchall()
-        return [row["title"] for row in rows]
+        return {(r["killer_id"], r["victim_id"]): r["c"] for r in rows}
 
-    def report_already_posted(self, chat_id: int, week_start: date) -> bool:
-        week = week_key(week_start)
+    def get_match_results_sequence(self, tournament_id: int) -> list[dict[int, bool]]:
+        with self.connect() as conn:
+            matches = conn.execute(
+                """
+                SELECT match_id, winner_team FROM matches
+                WHERE tournament_id = ? AND status = 'saved'
+                ORDER BY match_no
+                """,
+                (tournament_id,),
+            ).fetchall()
+            result = []
+            for m in matches:
+                rows = conn.execute(
+                    "SELECT user_id, team, top FROM match_players WHERE match_id = ?",
+                    (m["match_id"],),
+                ).fetchall()
+                entry = {}
+                for row in rows:
+                    if row["team"] in (1, 2):
+                        entry[row["user_id"]] = row["team"] == m["winner_team"]
+                    else:
+                        entry[row["user_id"]] = row["top"] == 1
+                result.append(entry)
+        return result
+
+    def get_league_totals(self, chat_id: int) -> list[PlayerTotals]:
+        with self.connect() as conn:
+            tournament_ids = [
+                r["tournament_id"]
+                for r in conn.execute(
+                    "SELECT tournament_id FROM tournaments WHERE chat_id = ? AND status = 'finished'",
+                    (chat_id,),
+                ).fetchall()
+            ]
+        all_totals: list[PlayerTotals] = []
+        for tournament_id in tournament_ids:
+            all_totals.extend(self.get_tournament_totals(tournament_id))
+        return merge_totals(all_totals)
+
+    def list_finished_tournaments(self, chat_id: int, limit: int = 20) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM tournaments
+                WHERE chat_id = ? AND status = 'finished'
+                ORDER BY finished_at DESC
+                LIMIT ?
+                """,
+                (chat_id, limit),
+            ).fetchall()
+
+    def list_recent_matches(self, tournament_id: int, limit: int = 10) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM matches
+                WHERE tournament_id = ? AND status = 'saved'
+                ORDER BY match_no DESC
+                LIMIT ?
+                """,
+                (tournament_id, limit),
+            ).fetchall()
+
+    # -- predictions / mvp -----------------------------------------------
+
+    def cast_prediction(self, *, tournament_id: int, voter_id: int, pick_user_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO predictions (tournament_id, voter_id, pick_user_id)
+                VALUES (?, ?, ?)
+                ON CONFLICT(tournament_id, voter_id) DO UPDATE SET pick_user_id = excluded.pick_user_id
+                """,
+                (tournament_id, voter_id, pick_user_id),
+            )
+
+    def has_any_saved_match(self, tournament_id: int) -> bool:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT 1 FROM weekly_reports_by_chat WHERE chat_id = ? AND week = ?",
-                (chat_id, week),
+                "SELECT 1 FROM matches WHERE tournament_id = ? AND status = 'saved' LIMIT 1",
+                (tournament_id,),
             ).fetchone()
         return row is not None
 
-    def mark_report_posted(self, chat_id: int, week_start: date, posted_at: datetime) -> None:
-        week = week_key(week_start)
+    def get_predictions(self, tournament_id: int) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                """
+                SELECT p.voter_id, p.pick_user_id, u.first_name AS voter_name, pu.first_name AS pick_name
+                FROM predictions p
+                JOIN users u ON u.user_id = p.voter_id
+                JOIN users pu ON pu.user_id = p.pick_user_id
+                WHERE p.tournament_id = ?
+                """,
+                (tournament_id,),
+            ).fetchall()
+
+    def cast_mvp_vote(self, *, tournament_id: int, voter_id: int, pick_user_id: int) -> None:
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO weekly_reports_by_chat (chat_id, week, posted_at)
+                INSERT INTO mvp_votes (tournament_id, voter_id, pick_user_id)
                 VALUES (?, ?, ?)
+                ON CONFLICT(tournament_id, voter_id) DO UPDATE SET pick_user_id = excluded.pick_user_id
                 """,
-                (chat_id, week, posted_at.isoformat()),
+                (tournament_id, voter_id, pick_user_id),
             )
 
-    def list_known_chats(self) -> list[int]:
+    def get_mvp_tally(self, tournament_id: int) -> list[sqlite3.Row]:
         with self.connect() as conn:
-            rows = conn.execute(
+            return conn.execute(
                 """
-                SELECT DISTINCT chat_id
-                FROM chat_members
-                ORDER BY chat_id
-                """
+                SELECT pu.user_id, pu.first_name, COUNT(*) AS votes
+                FROM mvp_votes v
+                JOIN users pu ON pu.user_id = v.pick_user_id
+                WHERE v.tournament_id = ?
+                GROUP BY pu.user_id
+                ORDER BY votes DESC
+                """,
+                (tournament_id,),
             ).fetchall()
-        return [row["chat_id"] for row in rows]
 
-    def get_active_chat_id(self) -> int | None:
+    # -- settings ----------------------------------------------------------
+
+    def get_setting(self, chat_id: int, name: str, default: bool = True) -> bool:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT value FROM bot_state WHERE key = 'active_chat_id'"
+                "SELECT value FROM bot_state WHERE key = ?", (f"setting:{chat_id}:{name}",)
             ).fetchone()
-        return int(row["value"]) if row else None
+        if row is None:
+            return default
+        return row["value"] == "1"
 
-    def set_active_chat_id(self, chat_id: int) -> None:
+    def toggle_setting(self, chat_id: int, name: str, default: bool = True) -> bool:
+        new_value = not self.get_setting(chat_id, name, default)
         with self.connect() as conn:
             conn.execute(
-                """
-                INSERT OR REPLACE INTO bot_state (key, value)
-                VALUES ('active_chat_id', ?)
-                """,
-                (str(chat_id),),
+                "INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)",
+                (f"setting:{chat_id}:{name}", "1" if new_value else "0"),
             )
+        return new_value
 
-    def _ensure_users_columns(self, conn: sqlite3.Connection) -> None:
-        columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()
-        }
-        if "is_bot" not in columns:
-            conn.execute(
-                "ALTER TABLE users ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0"
-            )
-
-    def _migrate_single_chat_data(self, conn: sqlite3.Connection) -> None:
-        active_chat_id = self._read_active_chat_id(conn)
-        if active_chat_id is None:
-            return
-
-        has_new_activity = conn.execute(
-            "SELECT 1 FROM activity_by_chat LIMIT 1"
-        ).fetchone()
-        if has_new_activity is None:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO activity_by_chat (
-                    chat_id, user_id, date, messages, reactions_received,
-                    reactions_given, mentions, forwards_public, video_notes
-                )
-                SELECT ?, user_id, date, messages, reactions_received,
-                       reactions_given, mentions, forwards_public, video_notes
-                FROM activity
-                """,
-                (active_chat_id,),
-            )
-
-        has_new_titles = conn.execute(
-            "SELECT 1 FROM titles_by_chat LIMIT 1"
-        ).fetchone()
-        if has_new_titles is None:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO titles_by_chat (chat_id, user_id, week, title)
-                SELECT ?, user_id, week, title
-                FROM titles
-                """,
-                (active_chat_id,),
-            )
-
-        has_new_reports = conn.execute(
-            "SELECT 1 FROM weekly_reports_by_chat LIMIT 1"
-        ).fetchone()
-        if has_new_reports is None:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO weekly_reports_by_chat (chat_id, week, posted_at)
-                SELECT ?, week, posted_at
-                FROM weekly_reports
-                """,
-                (active_chat_id,),
-            )
-
-    def _read_active_chat_id(self, conn: sqlite3.Connection) -> int | None:
-        row = conn.execute(
-            "SELECT value FROM bot_state WHERE key = 'active_chat_id'"
-        ).fetchone()
-        return int(row["value"]) if row else None
+    # -- internal ------------------------------------------------------------
 
     def _upsert_user(
-        self,
-        conn: sqlite3.Connection,
-        user_id: int,
-        username: str | None,
-        first_name: str,
-        is_bot: bool = False,
+        self, conn: sqlite3.Connection, user_id: int, username: str | None, first_name: str, is_bot: bool = False
     ) -> None:
         conn.execute(
             """
@@ -729,51 +725,12 @@ class Storage:
             (user_id, username, first_name, int(is_bot)),
         )
 
-    def _ensure_activity_row(
-        self,
-        conn: sqlite3.Connection,
-        chat_id: int,
-        user_id: int,
-        day: str,
-    ) -> None:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO activity_by_chat (
-                chat_id, user_id, date, messages, reactions_received, reactions_given,
-                mentions, forwards_public, video_notes
-            )
-            VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0)
-            """,
-            (chat_id, user_id, day),
-        )
-
-    def _touch_chat_member(
-        self,
-        conn: sqlite3.Connection,
-        chat_id: int,
-        user_id: int,
-        seen_at: str,
-    ) -> None:
+    def _touch_chat_member(self, conn: sqlite3.Connection, chat_id: int, user_id: int, seen_at: str) -> None:
         conn.execute(
             """
             INSERT INTO chat_members (chat_id, user_id, first_seen_at, last_seen_at)
             VALUES (?, ?, ?, ?)
-            ON CONFLICT(chat_id, user_id) DO UPDATE SET
-                last_seen_at = excluded.last_seen_at
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
             """,
             (chat_id, user_id, seen_at, seen_at),
-        )
-
-    def _has_week_activity(self, item: UserWeekStats) -> bool:
-        return any(
-            (
-                item.messages,
-                item.reactions_received,
-                item.reactions_given,
-                item.mentions,
-                item.forwards_public,
-                item.video_notes,
-                item.rep_plus,
-                item.rep_minus,
-            )
         )

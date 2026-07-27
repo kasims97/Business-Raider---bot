@@ -1,39 +1,52 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
-from collections import Counter
 from datetime import datetime
+from types import SimpleNamespace
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatType
 from telegram.ext import ContextTypes
 
-from bot.ai import SummaryError, summarize_chat
+from bot.ai import SummaryError, analyze_players, generate_quip
 from bot.config import Settings
-from bot.rating import (
-    format_personal_stats,
-    format_weekly_summary,
+from bot.stats import (
+    compute_current_streaks,
+    format_kd,
+    format_kill_matrix,
+    format_table,
+    league_rank,
     pick_titles,
-    sort_for_ranking,
-    week_start_for_dt,
+    sort_by_league_points,
+    sort_players,
 )
 from bot.storage import Storage
 
 logger = logging.getLogger(__name__)
 
-COMMAND_MY = re.compile(r"^/(мойрейтинг|myrating)(?:@\w+)?$")
-COMMAND_SUMMARY = re.compile(r"^/(итоги|summary)(?:@\w+)?$")
-COMMAND_ABOUT = re.compile(r"^/about(?:@\w+)?$")
-COMMAND_REP = re.compile(r"^/rep(?:@\w+)?$")
-COMMAND_CATCHUP = re.compile(r"^/catchup(?:@\w+)?$")
-COMMAND_OLD_REP = re.compile(r"^/([+-])rep(?:@\w+)?$")
+GAME_LABELS = {"pubg": "PUBG", "cs": "CS"}
+SETTINGS_LABELS = {
+    "quips": "🤖 Подколы от GPT",
+    "predictions": "🔮 Прогнозы перед турниром",
+    "mvp": "🗳 MVP-голосование",
+}
+
+COMMAND_MENU = re.compile(r"^/(бот|menu)(?:@\w+)?$")
+COMMAND_TABLE = re.compile(r"^/(таблица|table)(?:@\w+)?$")
+COMMAND_MATCH = re.compile(r"^/(матч|match)(?:@\w+)?$")
+COMMAND_LEAGUE = re.compile(r"^/(лига|league)(?:@\w+)?$")
+COMMAND_ANALYZE = re.compile(r"^/(разбор|analyze)(?:@\w+)?$")
+COMMAND_ABOUT = re.compile(r"^/(about|start)(?:@\w+)?$")
 
 
 class BotHandlers:
     def __init__(self, storage: Storage, settings: Settings):
         self.storage = storage
         self.settings = settings
+
+    # -- top-level routing -------------------------------------------------
 
     async def on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
@@ -45,8 +58,9 @@ class BotHandlers:
         if chat.type == ChatType.PRIVATE:
             await self._handle_private_message(update)
             return
-
         if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+            return
+        if user.is_bot:
             return
 
         now = self._localized(message.date)
@@ -58,649 +72,1038 @@ class BotHandlers:
             is_bot=user.is_bot,
             seen_at=now.date(),
         )
+
         text = (message.text or "").strip()
-
-        if self._maybe_capture_salute_transcript(update):
+        if not text:
             return
 
-        if COMMAND_MY.match(text):
-            await self._send_personal(update)
+        if not text.startswith("/"):
+            await self._handle_pending_text(update)
             return
-        if COMMAND_SUMMARY.match(text):
-            await self._send_summary(update)
-            return
-        if COMMAND_ABOUT.match(text):
+
+        if COMMAND_MENU.match(text):
+            await self._send_menu(update)
+        elif COMMAND_TABLE.match(text):
+            await self._send_table_command(update)
+        elif COMMAND_MATCH.match(text):
+            await self._send_match_command(update)
+        elif COMMAND_LEAGUE.match(text):
+            await self._send_league_command(update)
+        elif COMMAND_ANALYZE.match(text):
+            await self._send_analyze_command(update)
+        elif COMMAND_ABOUT.match(text):
             await self._send_about(update)
-            return
-        if COMMAND_CATCHUP.match(text):
-            await self._send_catchup(update)
-            return
-        if COMMAND_REP.match(text):
-            await self._show_rep_user_picker(update)
-            return
-
-        old_rep_match = COMMAND_OLD_REP.match(text)
-        if old_rep_match:
-            await self._handle_reply_rep(update, old_rep_match.group(1))
-            return
-
-        self.storage.record_message(
-            chat_id=message.chat_id,
-            message_id=message.message_id,
-            user_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            is_bot=user.is_bot,
-            day=now.date(),
-            is_forward_public=self._is_public_forward(message),
-            is_video_note=message.video_note is not None,
-        )
-        self.storage.save_message_content(
-            chat_id=chat.id,
-            message_id=message.message_id,
-            user_id=user.id,
-            message_date=now.date(),
-            message_type=self._message_type(message),
-            text_content=self._message_text_content(message),
-            reply_to_message_id=message.reply_to_message.message_id if message.reply_to_message else None,
-            file_id=self._message_file_id(message),
-            transcript_status=self._transcript_status_for_message(message),
-        )
-
-        mentioned_ids = self._extract_mentions(message)
-        self.storage.increment_mentions(
-            chat_id=chat.id,
-            user_ids=mentioned_ids,
-            day=now.date(),
-        )
-
-    async def on_message_reaction(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        reaction = update.message_reaction
-        if reaction is None:
-            return
-
-        current_day = self._localized(reaction.date).date()
-        delta = len(reaction.new_reaction) - len(reaction.old_reaction)
-        logger.info(
-            "Reaction update chat_id=%s message_id=%s delta=%s has_user=%s",
-            reaction.chat.id,
-            reaction.message_id,
-            delta,
-            reaction.user is not None,
-        )
-        if delta == 0:
-            return
-
-        applied = self.storage.apply_reaction_delta(
-            chat_id=reaction.chat.id,
-            message_id=reaction.message_id,
-            day=current_day,
-            delta=delta,
-        )
-        if not applied:
-            logger.info(
-                "Skipping reaction for unknown message chat_id=%s message_id=%s. "
-                "Бот увидел реакцию, но не видел исходное сообщение.",
-                reaction.chat.id,
-                reaction.message_id,
-            )
-            return
-
-        if reaction.user is not None:
-            self.storage.increment_reactions_given(
-                user_id=reaction.user.id,
-                username=reaction.user.username,
-                first_name=reaction.user.first_name,
-                is_bot=reaction.user.is_bot,
-                chat_id=reaction.chat.id,
-                day=current_day,
-                delta=delta,
-            )
 
     async def on_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
-        if query is None or query.data is None:
+        if query is None or query.data is None or query.message is None:
             return
-
-        data = query.data
-        if not data.startswith("rep:"):
-            return
-
-        if data.startswith("rep:c:"):
-            owner_user_id = int(data.split(":")[2])
-            if not self._is_callback_owner(update, owner_user_id):
-                await query.answer("Это меню не для тебя", show_alert=True)
-                return
-            await query.answer()
-            await query.edit_message_text("Выбор репутации отменён.")
-            return
-
-        if data.startswith("rep:u:"):
-            _, _, target_user_id, owner_user_id = data.split(":")
-            if not self._is_callback_owner(update, int(owner_user_id)):
-                await query.answer("Это меню не для тебя", show_alert=True)
-                return
-            await query.answer()
-            await self._show_rep_sign_picker(query, int(target_user_id), int(owner_user_id))
-            return
-
-        if data.startswith("rep:v:"):
-            _, _, target_user_id, owner_user_id, sign = data.split(":")
-            if not self._is_callback_owner(update, int(owner_user_id)):
-                await query.answer("Это меню не для тебя", show_alert=True)
-                return
-            await query.answer()
-            await self._apply_rep_from_callback(query, int(target_user_id), sign)
-
-    async def post_weekly_if_due(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        now = datetime.now(self.settings.timezone)
-        if now.weekday() != 6:
-            return
-        if (now.hour, now.minute) < (self.settings.post_hour, self.settings.post_minute):
-            return
-
-        week_start = week_start_for_dt(now)
-        for chat_id in self.storage.list_known_chats():
-            if self.storage.report_already_posted(chat_id, week_start):
-                continue
-            if not self.storage.get_week_stats(chat_id, week_start):
-                continue
-            text = self._build_summary_payload(chat_id, week_start, save_titles=True)
-            await context.bot.send_message(chat_id=chat_id, text=text)
-            self.storage.mark_report_posted(chat_id, week_start, now)
-
-    async def _send_personal(self, update: Update) -> None:
-        user = update.effective_user
-        message = update.effective_message
-        chat = update.effective_chat
-        if user is None or message is None or chat is None:
-            return
-
-        now = datetime.now(self.settings.timezone)
-        week_start = week_start_for_dt(now)
-        ranked = sort_for_ranking(self.storage.get_week_stats(chat.id, week_start))
-        for idx, item in enumerate(ranked, start=1):
-            if item.user_id == user.id:
-                titles = self.storage.get_titles_for_user(chat.id, week_start, user.id)
-                text = format_personal_stats(item, idx, len(ranked), titles)
-                await message.reply_text(text, do_quote=False)
-                return
-
-        await message.reply_text(
-            "Пока пусто: на этой неделе у тебя ещё нет активности в рейтинге.",
-            do_quote=False,
-        )
-
-    async def _send_summary(self, update: Update) -> None:
-        message = update.effective_message
-        chat = update.effective_chat
-        if message is None or chat is None:
-            return
-        now = datetime.now(self.settings.timezone)
-        week_start = week_start_for_dt(now)
-        text = self._build_summary_payload(chat.id, week_start, save_titles=False)
-        await message.reply_text(text, do_quote=False)
-
-    async def _send_about(self, update: Update) -> None:
-        message = update.effective_message
-        if message is None:
-            return
-        await message.reply_text(
-            "Я бот рейтинга чата. Слежу за активностью в течение недели, показываю, кто тащит движ, "
-            "а по воскресеньям публикую итоги и титулы. Через /rep или reply-команды /+rep и /-rep можно "
-            "дать участнику плюс или минус в репутацию. А через /catchup можно получить краткую выжимку "
-            "последних 100 сообщений.",
-            do_quote=False,
-        )
-
-    async def _send_catchup(self, update: Update) -> None:
-        message = update.effective_message
-        chat = update.effective_chat
-        if message is None or chat is None:
-            return
-
-        rows = self.storage.get_recent_message_content(chat_id=chat.id, limit=100)
-        if not rows:
-            await message.reply_text(
-                "Пока нечего пересказывать. Бот ещё не накопил сообщения для выжимки.",
-                do_quote=False,
-            )
-            return
-
-        status_message = await message.reply_text(
-            "Собираю краткую выжимку последних 100 сообщений...",
-            do_quote=False,
-        )
-
-        blocks: list[str] = []
-        missing_audio = 0
-        for row in rows:
-            if self._is_salute_row(row):
-                block = self._salute_row_to_summary_block(row)
-                if block:
-                    blocks.append(block)
-                continue
-            block = self._message_row_to_summary_block(row)
-            if block is None:
-                if row["message_type"] in {"voice", "video_note"} and row["transcript_status"] != "done":
-                    missing_audio += 1
-                continue
-            blocks.append(block)
-
-        if not blocks:
-            await status_message.edit_text(
-                "Пока нечего пересказывать: в последних сообщениях нет доступного текста для резюме."
-            )
-            return
-
-        try:
-            summary = summarize_chat(
-                settings=self.settings,
-                transcript_blocks=blocks,
-                missing_audio_count=missing_audio,
-            )
-        except SummaryError as exc:
-            logger.error("summarize_chat failed: %s", exc)
-            await status_message.edit_text(exc.public_message)
-            return
-
-        if missing_audio:
-            summary = (
-                f"{summary}\n\nНе всё аудио вошло в резюме: часть голосовых и кружочков ещё без расшифровки."
-            )
-        await status_message.edit_text(summary)
-
-    async def _show_rep_user_picker(self, update: Update) -> None:
-        message = update.effective_message
-        from_user = update.effective_user
-        chat = update.effective_chat
-        if message is None or from_user is None or chat is None:
-            return
-
-        candidates = self.storage.list_rep_candidates(
-            chat_id=chat.id,
-            exclude_user_id=from_user.id,
-        )
-        if not candidates:
-            await message.reply_text(
-                "Пока некого выбирать. Бот ещё не успел познакомиться с другими участниками чата.",
-                do_quote=False,
-            )
-            return
-
-        labels = self._build_candidate_labels(candidates)
-        keyboard = []
-        for candidate in candidates:
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        labels[candidate.user_id],
-                        callback_data=self._rep_pick_user_data(
-                            target_user_id=candidate.user_id,
-                            owner_user_id=from_user.id,
-                        ),
-                    )
-                ]
-            )
-        keyboard.append(
-            [InlineKeyboardButton("Отмена", callback_data=self._rep_cancel_data(from_user.id))]
-        )
-        await message.reply_text(
-            "Кому изменить репутацию?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            do_quote=False,
-        )
-
-    async def _show_rep_sign_picker(self, query, target_user_id: int, owner_user_id: int) -> None:
-        if query.message is None:
-            return
-        target = self._find_candidate_by_id(query.message.chat.id, owner_user_id, target_user_id)
-        if target is None:
-            await query.edit_message_text("Этот участник больше недоступен для выбора.")
-            return
-
-        label = self._build_candidate_labels([target])[target.user_id]
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "+rep",
-                        callback_data=self._rep_vote_data(target_user_id, owner_user_id, "+"),
-                    ),
-                    InlineKeyboardButton(
-                        "-rep",
-                        callback_data=self._rep_vote_data(target_user_id, owner_user_id, "-"),
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "Отмена",
-                        callback_data=self._rep_cancel_data(owner_user_id),
-                    )
-                ],
-            ]
-        )
-        await query.edit_message_text(
-            f"Что поставить для {label}?",
-            reply_markup=keyboard,
-        )
-
-    async def _apply_rep_from_callback(self, query, target_user_id: int, sign: str) -> None:
+        chat = query.message.chat
         actor = query.from_user
-        message = query.message
-        chat = message.chat if message is not None else None
-        if actor is None or message is None or chat is None:
-            return
-
-        target = self._find_candidate_by_id(chat.id, actor.id, target_user_id)
-        if target is None:
-            await query.edit_message_text("Этот участник больше недоступен для выбора.")
-            return
-
-        text = self._apply_rep_vote(
-            chat_id=chat.id,
-            actor=actor,
-            target=target,
-            sign=sign,
-        )
-        await query.edit_message_text(text)
-
-    async def _handle_reply_rep(self, update: Update, sign: str) -> None:
-        message = update.effective_message
-        actor = update.effective_user
-        chat = update.effective_chat
-        if message is None or actor is None or chat is None:
-            return
-
-        reply = message.reply_to_message
-        target_user = reply.from_user if reply is not None else None
-        if reply is None or target_user is None:
-            await message.reply_text(
-                "Используй эту команду ответом на сообщение участника.",
-                do_quote=False,
+        if actor is not None:
+            self.storage.register_chat_presence(
+                chat_id=chat.id,
+                user_id=actor.id,
+                username=actor.username,
+                first_name=actor.first_name,
+                is_bot=actor.is_bot,
+                seen_at=datetime.now(self.settings.timezone).date(),
             )
-            return
-        if target_user.id == actor.id:
-            await message.reply_text("Себе rep ставить нельзя.", do_quote=False)
-            return
-        if target_user.is_bot:
-            await message.reply_text("Ботам rep не ставится.", do_quote=False)
-            return
 
-        target = type("RepTarget", (), {
-            "user_id": target_user.id,
-            "username": target_user.username,
-            "first_name": target_user.first_name,
-        })()
-        text = self._apply_rep_vote(
-            chat_id=chat.id,
-            actor=actor,
-            target=target,
-            sign=sign,
-        )
-        await message.reply_text(text, do_quote=False)
-
-    def _apply_rep_vote(self, *, chat_id: int, actor, target, sign: str) -> str:
-        now = datetime.now(self.settings.timezone)
-        result = self.storage.apply_rep_vote(
-            chat_id=chat_id,
-            week_start=week_start_for_dt(now),
-            from_user_id=actor.id,
-            from_username=actor.username,
-            from_first_name=actor.first_name,
-            from_is_bot=actor.is_bot,
-            to_user_id=target.user_id,
-            to_username=target.username,
-            to_first_name=target.first_name,
-            to_is_bot=False,
-            value=1 if sign == "+" else -1,
-            voted_at=now,
-        )
-        target_name = self._build_candidate_labels([target])[target.user_id]
-        if result == "unchanged":
-            return f"У {target_name} уже стоит {sign}rep от тебя на этой неделе."
-        if result == "flipped":
-            return f"Голос переключён: {target_name} теперь получил {sign}rep."
-        return f"Засчитано: {target_name} получил {sign}rep."
-
-    def _build_summary_payload(self, chat_id: int, week_start, *, save_titles: bool) -> str:
-        stats = self.storage.get_week_stats(chat_id, week_start)
-        ranked = sort_for_ranking(stats)
-        title_pairs = pick_titles(stats)
-        if save_titles:
-            self.storage.save_titles(chat_id, week_start, title_pairs)
-        by_user_id = {item.user_id: item for item in stats}
-        titled_items = [
-            (by_user_id[user_id], title)
-            for user_id, title in title_pairs
-            if user_id in by_user_id
-        ]
-        return format_weekly_summary(
-            week_start,
-            ranked,
-            titled_items,
-            official=save_titles,
-        )
+        parts = query.data.split(":")
+        prefix = parts[0]
+        try:
+            if prefix == "mn":
+                await self._handle_menu_callback(query, chat.id, parts, context)
+            elif prefix == "tn":
+                await self._handle_setup_callback(query, chat.id, parts)
+            elif prefix == "mt":
+                await self._handle_match_callback(query, chat.id, parts, context)
+            elif prefix == "pl":
+                await self._handle_players_callback(query, chat.id, parts)
+            elif prefix == "st":
+                await self._handle_settings_callback(query, chat.id, parts)
+            elif prefix == "tl":
+                await self._handle_tournaments_callback(query, chat.id, parts)
+            elif prefix == "pr":
+                await self._handle_prediction_callback(query, parts)
+            elif prefix == "mv":
+                await self._handle_mvp_callback(query, parts)
+            elif prefix == "ap":
+                await self._handle_add_player_callback(query, chat.id, parts)
+            else:
+                await query.answer()
+        except Exception:
+            logger.exception("callback failed data=%s", query.data)
+            await query.answer("Что-то пошло не так, попробуй ещё раз.", show_alert=True)
 
     async def _handle_private_message(self, update: Update) -> None:
         message = update.effective_message
         if message is None:
             return
-        text = (message.text or "").strip()
-        if text.startswith("/start"):
-            await message.reply_text(
-                "Добавь меня в группу, и я начну вести рейтинг чата. В группе доступны команды: "
-                "/myrating, /summary, /rep, /+rep, /-rep, /catchup и /about.",
-                do_quote=False,
-            )
-        elif text.startswith("/about"):
-            await self._send_about(update)
+        await message.reply_text(
+            "Привет! Добавь меня в группу — там я веду турнирную таблицу PUBG/CS. "
+            "В группе команда /бот открывает меню.",
+            do_quote=False,
+        )
 
     def _localized(self, dt: datetime) -> datetime:
         return dt.astimezone(self.settings.timezone)
 
-    def _extract_mentions(self, message) -> list[int]:
-        result: list[int] = []
-        usernames: list[str] = []
+    # -- pending free-text input -------------------------------------------
 
-        for entity in tuple(message.entities or ()) + tuple(message.caption_entities or ()):
-            if entity.type == MessageEntity.TEXT_MENTION and entity.user is not None:
-                self.storage.upsert_user(
-                    entity.user.id,
-                    entity.user.username,
-                    entity.user.first_name,
-                    entity.user.is_bot,
-                )
-                result.append(entity.user.id)
-
-        if message.text:
-            usernames.extend(
-                mention.lstrip("@").lower()
-                for mention in message.parse_entities([MessageEntity.MENTION]).values()
-            )
-        if message.caption:
-            usernames.extend(
-                mention.lstrip("@").lower()
-                for mention in message.parse_caption_entities([MessageEntity.MENTION]).values()
-            )
-
-        if usernames:
-            mapping = self.storage.find_user_ids_by_usernames(usernames)
-            result.extend(mapping[name] for name in usernames if name in mapping)
-
-        return result
-
-    def _is_public_forward(self, message) -> bool:
-        origin = getattr(message, "forward_origin", None)
-        if origin is None:
-            return False
-
-        origin_type = type(origin).__name__
-        if origin_type in {"MessageOriginChannel"}:
-            return True
-
-        chat = getattr(origin, "chat", None)
-        if chat is not None and getattr(chat, "type", None) == ChatType.CHANNEL:
-            return True
-
-        sender_chat = getattr(message, "forward_from_chat", None)
-        if sender_chat is not None and sender_chat.type == ChatType.CHANNEL:
-            return True
-
-        return False
-
-    def _is_callback_owner(self, update: Update, owner_user_id: int) -> bool:
-        user = update.effective_user
-        return user is not None and user.id == owner_user_id
-
-    def _find_candidate_by_id(self, chat_id: int, owner_user_id: int, target_user_id: int):
-        for candidate in self.storage.list_rep_candidates(
-            chat_id=chat_id,
-            exclude_user_id=owner_user_id,
-        ):
-            if candidate.user_id == target_user_id:
-                return candidate
-        return None
-
-    def _build_candidate_labels(self, candidates) -> dict[int, str]:
-        base_labels: dict[int, str] = {}
-        counts: Counter[str] = Counter()
-        for candidate in candidates:
-            label = candidate.first_name
-            if candidate.username:
-                label = f"{candidate.first_name} (t.me/{candidate.username})"
-            base_labels[candidate.user_id] = label
-            counts[label] += 1
-
-        result: dict[int, str] = {}
-        for candidate in candidates:
-            label = base_labels[candidate.user_id]
-            if counts[label] > 1:
-                label = f"{label} #{str(candidate.user_id)[-4:]}"
-            result[candidate.user_id] = label
-        return result
-
-    def _rep_pick_user_data(self, target_user_id: int, owner_user_id: int) -> str:
-        return f"rep:u:{target_user_id}:{owner_user_id}"
-
-    def _rep_vote_data(self, target_user_id: int, owner_user_id: int, sign: str) -> str:
-        return f"rep:v:{target_user_id}:{owner_user_id}:{sign}"
-
-    def _rep_cancel_data(self, owner_user_id: int) -> str:
-        return f"rep:c:{owner_user_id}"
-
-    def _maybe_capture_salute_transcript(self, update: Update) -> bool:
+    async def _handle_pending_text(self, update: Update) -> None:
         message = update.effective_message
         user = update.effective_user
         chat = update.effective_chat
         if message is None or user is None or chat is None:
-            return False
-        if not user.is_bot:
-            return False
-        if (user.username or "").lower() != self.settings.salute_bot_username:
-            return False
-        if message.reply_to_message is None:
-            return False
+            return
+        kind = self.storage.pop_pending_input(chat_id=chat.id, user_id=user.id)
+        if kind is None:
+            return
 
-        transcript = self._extract_salute_transcript_text(message)
-        if not transcript:
-            return False
-        saved = self.storage.save_salute_transcript(
-            chat_id=chat.id,
-            reply_to_message_id=message.reply_to_message.message_id,
-            transcript_text=transcript,
-        )
-        if not saved:
-            logger.info(
-                "Salute transcript was not linked chat_id=%s reply_to_message_id=%s",
-                chat.id,
-                message.reply_to_message.message_id,
+        if kind == "tn_name":
+            draft = self.storage.get_setup_draft(chat.id)
+            if draft is None:
+                return
+            name = message.text.strip()[:60] or "Без названия"
+            self.storage.set_draft_name(draft["tournament_id"], name)
+            draft = self.storage.get_tournament(draft["tournament_id"])
+            text, kb = self._render_wizard_step(draft, chat.id)
+            await message.reply_text(text, reply_markup=kb, do_quote=False)
+            return
+
+        if kind.startswith("add_player:"):
+            origin = kind.split(":", 1)[1]
+            names = [n.strip() for n in message.text.split() if n.strip()][:5]
+            for name in names:
+                self.storage.add_guest_player(
+                    chat_id=chat.id, first_name=name, seen_at=self._localized(message.date).date()
+                )
+            if not names:
+                return
+            if origin == "setup":
+                draft = self.storage.get_setup_draft(chat.id)
+                if draft is not None:
+                    text, kb = self._render_roster_step(chat.id, draft["tournament_id"], bool(draft["team_mode"]))
+                    await message.reply_text(text, reply_markup=kb, do_quote=False)
+            elif origin == "roster":
+                tournament = self.storage.get_active_tournament(chat.id)
+                if tournament is not None:
+                    live = self.storage.get_live_match(tournament["tournament_id"])
+                    if live is not None:
+                        text, kb = self._render_match_roster(live["match_id"], chat.id)
+                        await message.reply_text(text, reply_markup=kb, do_quote=False)
+            else:
+                text, kb = self._render_players_screen(chat.id)
+                await message.reply_text(text, reply_markup=kb, do_quote=False)
+
+    # -- command shortcuts ---------------------------------------------------
+
+    async def _send_menu(self, update: Update) -> None:
+        message = update.effective_message
+        chat = update.effective_chat
+        text, kb = self._render_main_menu(chat.id)
+        await message.reply_text(text, reply_markup=kb, do_quote=False)
+
+    async def _send_table_command(self, update: Update) -> None:
+        message = update.effective_message
+        chat = update.effective_chat
+        text, kb = self._render_table_view(chat.id)
+        await message.reply_text(text, reply_markup=kb, parse_mode="HTML", do_quote=False)
+
+    async def _send_match_command(self, update: Update) -> None:
+        message = update.effective_message
+        chat = update.effective_chat
+        tournament = self.storage.get_active_tournament(chat.id)
+        if tournament is None:
+            await message.reply_text(
+                "Сейчас турнир не идёт. Открой /бот → 🏆 Новый турнир.", do_quote=False
             )
-        return saved
+            return
+        live = self.storage.get_live_match(tournament["tournament_id"])
+        if live is None:
+            await message.reply_text("Матч не найден.", do_quote=False)
+            return
+        text, kb = self._render_scoreboard(live["match_id"])
+        await message.reply_text(text, reply_markup=kb, parse_mode="HTML", do_quote=False)
 
-    def _extract_salute_transcript_text(self, message) -> str | None:
-        text = (message.text or message.caption or "").strip()
-        if not text:
-            return None
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        if len(lines) >= 3 and lines[1].lower() in {"voice message", "video note"}:
-            return " ".join(lines[2:]).strip()
-        if len(lines) >= 2 and lines[0].lower() not in {"voice message", "video note"}:
-            return " ".join(lines[1:]).strip()
-        return text
+    async def _send_league_command(self, update: Update) -> None:
+        message = update.effective_message
+        chat = update.effective_chat
+        text, kb = self._render_league_view(chat.id)
+        await message.reply_text(text, reply_markup=kb, do_quote=False)
 
-    def _message_type(self, message) -> str:
-        if message.voice is not None:
-            return "voice"
-        if message.video_note is not None:
-            return "video_note"
-        if message.forward_origin is not None:
-            return "forward"
-        if message.caption:
-            return "caption"
-        if message.text:
-            return "text"
-        return "other"
+    async def _send_analyze_command(self, update: Update) -> None:
+        message = update.effective_message
+        chat = update.effective_chat
+        status = await message.reply_text("⏳ Считаю разбор...", do_quote=False)
+        await self._run_analyze(chat.id, status)
 
-    def _message_text_content(self, message) -> str | None:
-        text = (message.text or message.caption or "").strip()
-        return text or None
-
-    def _message_file_id(self, message) -> str | None:
-        if message.voice is not None:
-            return message.voice.file_id
-        if message.video_note is not None:
-            return message.video_note.file_id
-        return None
-
-    def _transcript_status_for_message(self, message) -> str:
-        if message.voice is not None or message.video_note is not None:
-            return "missing"
-        return "not_needed"
-
-    def _message_row_to_summary_block(self, row) -> str | None:
-        name = row["first_name"]
-        if row["username"]:
-            name = f"{row['first_name']} (t.me/{row['username']})"
-        message_type = row["message_type"]
-        if message_type in {"voice", "video_note"}:
-            transcript = row["transcript_text"]
-            if not transcript:
-                return None
-            prefix = "[кружочек]" if message_type == "video_note" else "[голосовое]"
-            return f"{name}: {prefix} {transcript}"
-        text = (row["text_content"] or "").strip()
-        if not text:
-            return None
-        if message_type == "forward":
-            text = f"[переслано] {text}"
-        return f"{name}: {text}"
-
-    def _is_salute_row(self, row) -> bool:
-        return bool(
-            row["is_bot"]
-            and row["username"]
-            and row["username"].lower() == self.settings.salute_bot_username
+    async def _send_about(self, update: Update) -> None:
+        message = update.effective_message
+        await message.reply_text(
+            "Я турнирный бот PUBG/CS. Команда /бот открывает меню: заводишь турнир, дальше во время "
+            "игры только жмёшь кнопки — убийства, топы, победы команд. Веду таблицу, историю, лигу "
+            "за всё время и разбор от GPT.",
+            do_quote=False,
         )
 
-    def _salute_row_to_summary_block(self, row) -> str | None:
-        text = (row["text_content"] or "").strip()
-        if not text:
-            return None
-        cleaned = self._extract_transcript_text_from_plain_text(text)
-        if not cleaned:
-            return None
-        return f"SaluteSpeech: [расшифровка] {cleaned}"
+    # -- main menu -----------------------------------------------------------
 
-    def _extract_transcript_text_from_plain_text(self, text: str) -> str | None:
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        if not lines:
-            return None
-        service_lines = {"voice message", "video note"}
-        lower_lines = [line.lower() for line in lines]
-        for idx, line in enumerate(lower_lines):
-            if line in service_lines and idx + 1 < len(lines):
-                return " ".join(lines[idx + 1 :]).strip()
-        if len(lines) >= 2 and lower_lines[0] not in service_lines:
-            return " ".join(lines[1:]).strip()
-        return text.strip()
+    def _render_main_menu(self, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        active = self.storage.get_active_tournament(chat_id)
+        draft = self.storage.get_setup_draft(chat_id)
+        rows: list[list[InlineKeyboardButton]] = []
+        if active is not None:
+            rows.append([InlineKeyboardButton("▶️ Вернуться к матчу", callback_data="mn:resume")])
+        elif draft is not None:
+            rows.append([InlineKeyboardButton("▶️ Продолжить настройку", callback_data="mn:new")])
+        else:
+            rows.append([InlineKeyboardButton("🏆 Новый турнир", callback_data="mn:new")])
+        rows.append(
+            [
+                InlineKeyboardButton("📊 Таблица", callback_data="mn:table"),
+                InlineKeyboardButton("📜 История", callback_data="mn:history"),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton("🎖 Лига", callback_data="mn:league"),
+                InlineKeyboardButton("🤖 Разбор", callback_data="mn:analyze"),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton("👥 Игроки", callback_data="mn:players"),
+                InlineKeyboardButton("🗂 Прошлые турниры", callback_data="mn:tournaments"),
+            ]
+        )
+        rows.append([InlineKeyboardButton("⚙️ Настройки", callback_data="mn:settings")])
+        return "🎮 Турнирный бот", InlineKeyboardMarkup(rows)
+
+    def _back_to_menu_kb(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("← Меню", callback_data="mn:home")]])
+
+    async def _handle_menu_callback(self, query, chat_id: int, parts: list[str], context) -> None:
+        action = parts[1]
+        if action == "home":
+            text, kb = self._render_main_menu(chat_id)
+            await query.answer()
+            await query.edit_message_text(text, reply_markup=kb)
+        elif action == "new":
+            await self._start_or_resume_setup(query, chat_id)
+        elif action == "resume":
+            tournament = self.storage.get_active_tournament(chat_id)
+            if tournament is None:
+                await query.answer("Турнир не идёт.", show_alert=True)
+                return
+            live = self.storage.get_live_match(tournament["tournament_id"])
+            await query.answer()
+            if live is not None:
+                text, kb = self._render_scoreboard(live["match_id"])
+                await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+        elif action == "table":
+            await query.answer()
+            text, kb = self._render_table_view(chat_id)
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+        elif action == "history":
+            await query.answer()
+            text, kb = self._render_history_view(chat_id)
+            await query.edit_message_text(text, reply_markup=kb)
+        elif action == "undo":
+            tournament = self._resolve_view_target(chat_id)
+            if tournament is None:
+                await query.answer("Нечего отменять.", show_alert=True)
+                return
+            ok = self.storage.undo_last_saved_match(tournament["tournament_id"])
+            await query.answer("Матч отменён." if ok else "Нет сохранённых матчей.")
+            text, kb = self._render_history_view(chat_id)
+            await query.edit_message_text(text, reply_markup=kb)
+        elif action == "league":
+            await query.answer()
+            text, kb = self._render_league_view(chat_id)
+            await query.edit_message_text(text, reply_markup=kb)
+        elif action == "analyze":
+            await query.answer()
+            await query.edit_message_text("⏳ Считаю разбор...")
+            await self._run_analyze(chat_id, query.message)
+        elif action == "tournaments":
+            await query.answer()
+            text, kb = self._render_tournaments_screen(chat_id)
+            await query.edit_message_text(text, reply_markup=kb)
+        elif action == "players":
+            await query.answer()
+            text, kb = self._render_players_screen(chat_id)
+            await query.edit_message_text(text, reply_markup=kb)
+        elif action == "settings":
+            await query.answer()
+            text, kb = self._render_settings_screen(chat_id)
+            await query.edit_message_text(text, reply_markup=kb)
+        else:
+            await query.answer()
+
+    def _resolve_view_target(self, chat_id: int):
+        active = self.storage.get_active_tournament(chat_id)
+        if active is not None:
+            return active
+        finished = self.storage.list_finished_tournaments(chat_id, limit=1)
+        return finished[0] if finished else None
+
+    def _render_table_view(self, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        tournament = self._resolve_view_target(chat_id)
+        if tournament is None:
+            return "Пока не было ни одного турнира. Нажми «🏆 Новый турнир».", self._back_to_menu_kb()
+        totals = self.storage.get_tournament_totals(tournament["tournament_id"])
+        text = format_table(
+            tournament_name=tournament["name"],
+            game_label=GAME_LABELS.get(tournament["game"], tournament["game"]),
+            players=totals,
+        )
+        return text, self._back_to_menu_kb()
+
+    def _render_history_view(self, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        tournament = self._resolve_view_target(chat_id)
+        if tournament is None:
+            return "Пока нет истории матчей.", self._back_to_menu_kb()
+        matches = self.storage.list_recent_matches(tournament["tournament_id"], limit=10)
+        if not matches:
+            text = "В этом турнире ещё нет сыгранных матчей."
+        else:
+            lines = [f"📜 История · {tournament['name']}", ""]
+            for m in matches:
+                kills = self.storage.get_match_kills(m["match_id"])
+                by_killer: dict[str, list[str]] = {}
+                for k in kills:
+                    by_killer.setdefault(k["killer_name"], []).append(k["victim_name"] or "случайного")
+                kill_text = "; ".join(f"{name} убил {', '.join(v)}" for name, v in by_killer.items())
+                if tournament["team_mode"]:
+                    if m["winner_team"] == 1:
+                        winner = "Команда А"
+                    elif m["winner_team"] == 2:
+                        winner = "Команда Б"
+                    else:
+                        winner = "—"
+                else:
+                    players = self.storage.get_match_players(m["match_id"])
+                    winners = [p["first_name"] for p in players if p["top"]]
+                    winner = ", ".join(winners) if winners else "—"
+                line = f"#{m['match_no']} · 🏆 {winner}"
+                if kill_text:
+                    line += f" · {kill_text}"
+                lines.append(line)
+            text = "\n".join(lines)
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("↩️ Отменить последний матч", callback_data="mn:undo")],
+                [InlineKeyboardButton("← Меню", callback_data="mn:home")],
+            ]
+        )
+        return text, kb
+
+    def _render_league_view(self, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        totals = self.storage.get_league_totals(chat_id)
+        if not totals:
+            return "Лига пока пуста — заверши хотя бы один турнир.", self._back_to_menu_kb()
+        ranked = sort_by_league_points(totals)
+        finished_count = len(self.storage.list_finished_tournaments(chat_id, limit=1000))
+        lines = [f"🎖 Лига · {finished_count} турниров", ""]
+        for i, p in enumerate(ranked, start=1):
+            rank = league_rank(p.league_points)
+            lines.append(
+                f"{i}. {rank} {p.first_name}   {p.league_points} · {p.tops} побед · "
+                f"{p.kills} убийств · KD {format_kd(p.kd)}"
+            )
+        return "\n".join(lines), self._back_to_menu_kb()
+
+    # -- tournament setup wizard ---------------------------------------------
+
+    async def _start_or_resume_setup(self, query, chat_id: int) -> None:
+        draft = self.storage.get_setup_draft(chat_id)
+        if draft is None:
+            active = self.storage.get_active_tournament(chat_id)
+            if active is not None:
+                await query.answer("Турнир уже идёт. Сначала заверши текущий.", show_alert=True)
+                return
+            tournament_id = self.storage.create_setup_draft(chat_id=chat_id, created_by=query.from_user.id)
+            draft = self.storage.get_tournament(tournament_id)
+        await query.answer()
+        text, kb = self._render_wizard_step(draft, chat_id)
+        await query.edit_message_text(text, reply_markup=kb)
+
+    def _render_wizard_step(self, draft, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        if not draft["name"]:
+            return self._render_name_step()
+        if not draft["game"]:
+            return self._render_game_step()
+        if draft["team_mode"] is None:
+            return self._render_mode_step()
+        return self._render_roster_step(chat_id, draft["tournament_id"], bool(draft["team_mode"]))
+
+    def _render_name_step(self) -> tuple[str, InlineKeyboardMarkup]:
+        today = datetime.now(self.settings.timezone).strftime("%d.%m")
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(f"Сегодня, {today}", callback_data="tn:name:today")],
+                [InlineKeyboardButton("✏️ Своё название", callback_data="tn:name:custom")],
+            ]
+        )
+        return "Как назовём турнир?", kb
+
+    def _render_game_step(self) -> tuple[str, InlineKeyboardMarkup]:
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("PUBG", callback_data="tn:game:pubg"), InlineKeyboardButton("CS", callback_data="tn:game:cs")]]
+        )
+        return "Игра?", kb
+
+    def _render_mode_step(self) -> tuple[str, InlineKeyboardMarkup]:
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Соло — каждый сам за себя", callback_data="tn:mode:solo")],
+                [InlineKeyboardButton("Командами", callback_data="tn:mode:team")],
+            ]
+        )
+        return "Как играем?", kb
+
+    def _render_roster_step(self, chat_id: int, tournament_id: int, team_mode: bool) -> tuple[str, InlineKeyboardMarkup]:
+        all_players = self.storage.list_players(chat_id)
+        selected = {r["user_id"]: r["team"] for r in self.storage.get_draft_players(tournament_id)}
+        rows: list[list[InlineKeyboardButton]] = []
+        line: list[InlineKeyboardButton] = []
+        for p in all_players:
+            team = selected.get(p.user_id)
+            if not team_mode:
+                label = f"{'✅' if team is not None else '⬜'} {p.first_name}"
+            else:
+                icon = {None: "⬜", 1: "🅰", 2: "🅱"}[team]
+                label = f"{icon} {p.first_name}"
+            line.append(InlineKeyboardButton(label, callback_data=f"tn:p:{p.user_id}"))
+            if len(line) == 2:
+                rows.append(line)
+                line = []
+        if line:
+            rows.append(line)
+        rows.append([InlineKeyboardButton("➕ Добавить игрока", callback_data="ap:setup")])
+        rows.append(
+            [
+                InlineKeyboardButton("🚀 Начать турнир", callback_data="tn:start"),
+                InlineKeyboardButton("🗑 Отмена", callback_data="tn:cancel"),
+            ]
+        )
+        text = "Кто играет? (тапни, чтобы выбрать команду)" if team_mode else "Кто играет?"
+        if not all_players:
+            text += "\n\nПока никого не знаю — напиши что-нибудь в чат или добавь игрока вручную."
+        return text, InlineKeyboardMarkup(rows)
+
+    async def _handle_setup_callback(self, query, chat_id: int, parts: list[str]) -> None:
+        draft = self.storage.get_setup_draft(chat_id)
+        if draft is None:
+            await query.answer("Настройка турнира уже не активна.", show_alert=True)
+            return
+        tournament_id = draft["tournament_id"]
+        action = parts[1]
+
+        if action == "name":
+            if parts[2] == "today":
+                name = f"Сегодня, {datetime.now(self.settings.timezone).strftime('%d.%m')}"
+                self.storage.set_draft_name(tournament_id, name)
+                await query.answer()
+                draft = self.storage.get_tournament(tournament_id)
+                text, kb = self._render_wizard_step(draft, chat_id)
+                await query.edit_message_text(text, reply_markup=kb)
+            else:
+                self.storage.set_pending_input(chat_id=chat_id, user_id=query.from_user.id, kind="tn_name")
+                await query.answer("Напиши название одним сообщением в чат.", show_alert=True)
+            return
+
+        if action == "game":
+            self.storage.set_draft_game(tournament_id, parts[2])
+            await query.answer()
+            draft = self.storage.get_tournament(tournament_id)
+            text, kb = self._render_wizard_step(draft, chat_id)
+            await query.edit_message_text(text, reply_markup=kb)
+            return
+
+        if action == "mode":
+            self.storage.set_draft_mode(tournament_id, parts[2] == "team")
+            await query.answer()
+            draft = self.storage.get_tournament(tournament_id)
+            text, kb = self._render_wizard_step(draft, chat_id)
+            await query.edit_message_text(text, reply_markup=kb)
+            return
+
+        if action == "p":
+            user_id = int(parts[2])
+            self.storage.toggle_draft_player(tournament_id, user_id, bool(draft["team_mode"]))
+            await query.answer()
+            text, kb = self._render_roster_step(chat_id, tournament_id, bool(draft["team_mode"]))
+            await query.edit_message_text(text, reply_markup=kb)
+            return
+
+        if action == "start":
+            await self._start_tournament(query, chat_id, draft)
+            return
+
+        if action == "cancel":
+            self.storage.cancel_draft(tournament_id)
+            await query.answer("Отменено.")
+            text, kb = self._render_main_menu(chat_id)
+            await query.edit_message_text(text, reply_markup=kb)
+            return
+
+    async def _start_tournament(self, query, chat_id: int, draft) -> None:
+        tournament_id = draft["tournament_id"]
+        team_mode = bool(draft["team_mode"])
+        players = self.storage.get_draft_players(tournament_id)
+        if team_mode:
+            has_a = any(p["team"] == 1 for p in players)
+            has_b = any(p["team"] == 2 for p in players)
+            if not (has_a and has_b):
+                await query.answer("Нужен хотя бы один игрок в каждой команде.", show_alert=True)
+                return
+        elif len(players) < 2:
+            await query.answer("Нужно минимум два игрока.", show_alert=True)
+            return
+
+        match_id = self.storage.start_tournament(tournament_id)
+        tournament = self.storage.get_tournament(tournament_id)
+        await query.answer()
+        await query.edit_message_text(f"🚀 Турнир «{tournament['name']}» начат!")
+
+        if self.storage.get_setting(chat_id, "predictions") and len(players) >= 2:
+            candidates = [SimpleNamespace(user_id=p["user_id"], first_name=p["first_name"]) for p in players]
+            text, kb = self._render_prediction_poll(tournament_id, candidates)
+            await query.message.reply_text(text, reply_markup=kb, do_quote=False)
+
+        text, kb = self._render_scoreboard(match_id)
+        await query.message.reply_text(text, reply_markup=kb, parse_mode="HTML", do_quote=False)
+
+    # -- live match scoreboard -----------------------------------------------
+
+    def _render_scoreboard(self, match_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        match = self.storage.get_match(match_id)
+        tournament = self.storage.get_tournament(match["tournament_id"])
+        players = sorted(self.storage.get_match_players(match_id), key=lambda r: r["first_name"])
+        game_label = GAME_LABELS.get(tournament["game"], tournament["game"])
+        mode_label = "командами" if tournament["team_mode"] else "соло"
+        header = f"🏆 {tournament['name']} · {game_label} {mode_label}\nМатч #{match['match_no']}"
+
+        rows: list[list[InlineKeyboardButton]] = []
+        if not tournament["team_mode"]:
+            lines = [f"{p['first_name']:<12} {p['kills']} убийств" + (" · 🏆" if p["top"] else "") for p in players]
+            for p in players:
+                rows.append(
+                    [
+                        InlineKeyboardButton(f"➕ {p['first_name']}", callback_data=f"mt:kill:{p['user_id']}"),
+                        InlineKeyboardButton("−", callback_data=f"mt:undo:{p['user_id']}"),
+                        InlineKeyboardButton("🏆" if p["top"] else "⬜", callback_data=f"mt:top:{p['user_id']}"),
+                    ]
+                )
+        else:
+            team_a = [p for p in players if p["team"] == 1]
+            team_b = [p for p in players if p["team"] == 2]
+            winner = match["winner_team"]
+            lines = ["🅰 команда" + (" 🏆" if winner == 1 else "")]
+            lines += [f"{p['first_name']:<12} {p['kills']} убийств" for p in team_a]
+            lines.append("")
+            lines.append("🅱 команда" + (" 🏆" if winner == 2 else ""))
+            lines += [f"{p['first_name']:<12} {p['kills']} убийств" for p in team_b]
+            for p in players:
+                rows.append(
+                    [
+                        InlineKeyboardButton(f"➕ {p['first_name']}", callback_data=f"mt:kill:{p['user_id']}"),
+                        InlineKeyboardButton("−", callback_data=f"mt:undo:{p['user_id']}"),
+                    ]
+                )
+            rows.append(
+                [
+                    InlineKeyboardButton("🏆 Победила А", callback_data="mt:win:1"),
+                    InlineKeyboardButton("🏆 Победила Б", callback_data="mt:win:2"),
+                ]
+            )
+        rows.append([InlineKeyboardButton("✅ Матч сыгран", callback_data="mt:save")])
+        rows.append(
+            [
+                InlineKeyboardButton("👥 Состав", callback_data="mt:roster"),
+                InlineKeyboardButton("🏁 Завершить турнир", callback_data="mt:finish"),
+            ]
+        )
+        body = "<pre>" + "\n".join(lines) + "</pre>" if lines else "Пока никого в составе."
+        return f"{header}\n\n{body}", InlineKeyboardMarkup(rows)
+
+    def _render_victim_picker(self, match_id: int, killer_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        match = self.storage.get_match(match_id)
+        tournament = self.storage.get_tournament(match["tournament_id"])
+        players = self.storage.get_match_players(match_id)
+        killer = next((p for p in players if p["user_id"] == killer_id), None)
+        if killer is None:
+            return self._render_scoreboard(match_id)
+        if tournament["team_mode"]:
+            candidates = [p for p in players if p["team"] != killer["team"]]
+        else:
+            candidates = [p for p in players if p["user_id"] != killer_id]
+
+        rows: list[list[InlineKeyboardButton]] = []
+        line: list[InlineKeyboardButton] = []
+        for c in candidates:
+            line.append(InlineKeyboardButton(c["first_name"], callback_data=f"mt:victim:{killer_id}:{c['user_id']}"))
+            if len(line) == 2:
+                rows.append(line)
+                line = []
+        if line:
+            rows.append(line)
+        rows.append([InlineKeyboardButton("🎲 Рандома / не из наших", callback_data=f"mt:victim:{killer_id}:0")])
+        rows.append([InlineKeyboardButton("← Назад", callback_data="mt:back")])
+
+        team_note = ""
+        if tournament["team_mode"]:
+            team_note = " (🅰)" if killer["team"] == 1 else " (🅱)"
+        return f"Кого убил {killer['first_name']}{team_note}?", InlineKeyboardMarkup(rows)
+
+    def _render_match_roster(self, match_id: int, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        match = self.storage.get_match(match_id)
+        tournament = self.storage.get_tournament(match["tournament_id"])
+        team_mode = bool(tournament["team_mode"])
+        all_players = self.storage.list_players(chat_id)
+        current = {p["user_id"]: p["team"] for p in self.storage.get_match_players(match_id)}
+        rows: list[list[InlineKeyboardButton]] = []
+        line: list[InlineKeyboardButton] = []
+        for p in all_players:
+            team = current.get(p.user_id)
+            if not team_mode:
+                label = f"{'✅' if team is not None else '⬜'} {p.first_name}"
+            else:
+                icon = {None: "⬜", 1: "🅰", 2: "🅱"}[team]
+                label = f"{icon} {p.first_name}"
+            line.append(InlineKeyboardButton(label, callback_data=f"mt:roster:p:{p.user_id}"))
+            if len(line) == 2:
+                rows.append(line)
+                line = []
+        if line:
+            rows.append(line)
+        rows.append([InlineKeyboardButton("➕ Добавить игрока", callback_data="ap:roster")])
+        rows.append([InlineKeyboardButton("✅ Готово", callback_data="mt:roster:done")])
+        return "Кто играет сейчас?", InlineKeyboardMarkup(rows)
+
+    def _build_match_recap(self, match_id: int) -> str:
+        match = self.storage.get_match(match_id)
+        tournament = self.storage.get_tournament(match["tournament_id"])
+        players = self.storage.get_match_players(match_id)
+        kills = self.storage.get_match_kills(match_id)
+
+        if tournament["team_mode"]:
+            if match["winner_team"] == 1:
+                winner = "Команда А"
+            elif match["winner_team"] == 2:
+                winner = "Команда Б"
+            else:
+                winner = "нет победителя"
+            header = f"Матч #{match['match_no']} · 🏆 {winner}"
+        else:
+            winners = [p["first_name"] for p in players if p["top"]]
+            header = f"Матч #{match['match_no']} · 🏆 {', '.join(winners) if winners else 'нет топа'}"
+
+        by_killer: dict[str, list[str]] = {}
+        for k in kills:
+            by_killer.setdefault(k["killer_name"], []).append(k["victim_name"] or "случайного")
+        kill_text = " · ".join(f"{name} убил {', '.join(v)}" for name, v in by_killer.items())
+
+        names = {p["user_id"]: p["first_name"] for p in players}
+        streaks = compute_current_streaks(self.storage.get_match_results_sequence(match["tournament_id"]))
+        streak_text = " · ".join(
+            f"{icon} {names[uid]}: {length} подряд" for uid, (icon, length) in streaks.items() if uid in names
+        )
+
+        parts = [header]
+        if kill_text:
+            parts.append(kill_text)
+        if streak_text:
+            parts.append(streak_text)
+        return "\n".join(parts)
+
+    async def _handle_match_callback(self, query, chat_id: int, parts: list[str], context) -> None:
+        action = parts[1]
+
+        if action == "back":
+            tournament = self.storage.get_active_tournament(chat_id)
+            live = self.storage.get_live_match(tournament["tournament_id"]) if tournament else None
+            if live is None:
+                await query.answer()
+                return
+            await query.answer()
+            text, kb = self._render_scoreboard(live["match_id"])
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+            return
+
+        tournament = self.storage.get_active_tournament(chat_id)
+        if tournament is None:
+            await query.answer("Турнир уже не активен.", show_alert=True)
+            return
+        live = self.storage.get_live_match(tournament["tournament_id"])
+        if live is None:
+            await query.answer("Матч уже не активен.", show_alert=True)
+            return
+        match_id = live["match_id"]
+
+        if action == "kill":
+            killer_id = int(parts[2])
+            await query.answer()
+            text, kb = self._render_victim_picker(match_id, killer_id)
+            await query.edit_message_text(text, reply_markup=kb)
+            return
+
+        if action == "victim":
+            killer_id, victim_id = int(parts[2]), int(parts[3])
+            self.storage.record_kill(match_id=match_id, killer_id=killer_id, victim_id=victim_id or None)
+            await query.answer("Убийство засчитано.")
+            text, kb = self._render_scoreboard(match_id)
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+            return
+
+        if action == "undo":
+            user_id = int(parts[2])
+            ok = self.storage.undo_last_kill(match_id=match_id, killer_id=user_id)
+            await query.answer("Отменено." if ok else "Нечего отменять.")
+            text, kb = self._render_scoreboard(match_id)
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+            return
+
+        if action == "top":
+            user_id = int(parts[2])
+            self.storage.toggle_top(match_id=match_id, user_id=user_id)
+            await query.answer()
+            text, kb = self._render_scoreboard(match_id)
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+            return
+
+        if action == "win":
+            team = int(parts[2])
+            self.storage.set_winner_team(match_id=match_id, team=team)
+            await query.answer(f"Победила команда {'А' if team == 1 else 'Б'}.")
+            text, kb = self._render_scoreboard(match_id)
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+            return
+
+        if action == "roster":
+            if len(parts) == 2:
+                await query.answer()
+                text, kb = self._render_match_roster(match_id, chat_id)
+                await query.edit_message_text(text, reply_markup=kb)
+                return
+            if parts[2] == "p":
+                user_id = int(parts[3])
+                self.storage.toggle_match_roster(match_id, user_id, bool(tournament["team_mode"]))
+                await query.answer()
+                text, kb = self._render_match_roster(match_id, chat_id)
+                await query.edit_message_text(text, reply_markup=kb)
+                return
+            if parts[2] == "done":
+                await query.answer()
+                text, kb = self._render_scoreboard(match_id)
+                await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+                return
+
+        if action == "save":
+            new_match_id = self.storage.save_match_and_advance(
+                tournament_id=tournament["tournament_id"], match_id=match_id
+            )
+            recap = self._build_match_recap(match_id)
+            await query.answer("Матч сохранён.")
+            await query.edit_message_text(recap)
+
+            totals = self.storage.get_tournament_totals(tournament["tournament_id"])
+            table_text = format_table(
+                tournament_name=tournament["name"],
+                game_label=GAME_LABELS.get(tournament["game"], tournament["game"]),
+                players=totals,
+            )
+            await query.message.reply_text(table_text, parse_mode="HTML", do_quote=False)
+
+            text, kb = self._render_scoreboard(new_match_id)
+            await query.message.reply_text(text, reply_markup=kb, parse_mode="HTML", do_quote=False)
+
+            if self.settings.openai_api_key and self.storage.get_setting(chat_id, "quips"):
+                asyncio.create_task(self._post_quip(chat_id, context.bot, recap))
+            return
+
+        if action == "finish":
+            if len(parts) == 2:
+                saved = self.storage.list_recent_matches(tournament["tournament_id"], limit=1000)
+                await query.answer()
+                kb = InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton("✅ Да, завершить", callback_data="mt:finish:yes"),
+                            InlineKeyboardButton("← Отмена", callback_data="mt:finish:no"),
+                        ]
+                    ]
+                )
+                await query.edit_message_text(
+                    f"Точно завершить турнир? Сыграно матчей: {len(saved)}", reply_markup=kb
+                )
+                return
+            if parts[2] == "no":
+                await query.answer()
+                text, kb = self._render_scoreboard(match_id)
+                await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+                return
+            if parts[2] == "yes":
+                await query.answer()
+                await self._finish_tournament_flow(query, tournament)
+                return
+
+    async def _post_quip(self, chat_id: int, bot, context_text: str) -> None:
+        try:
+            quip = await asyncio.to_thread(generate_quip, settings=self.settings, context=context_text)
+        except Exception:
+            logger.exception("generate_quip failed")
+            return
+        if quip:
+            await bot.send_message(chat_id=chat_id, text=f"🤖 {quip}")
+
+    # -- prediction poll -------------------------------------------------
+
+    def _render_prediction_poll(self, tournament_id: int, players) -> tuple[str, InlineKeyboardMarkup]:
+        rows: list[list[InlineKeyboardButton]] = []
+        line: list[InlineKeyboardButton] = []
+        for p in players:
+            line.append(InlineKeyboardButton(p.first_name, callback_data=f"pr:{tournament_id}:{p.user_id}"))
+            if len(line) == 2:
+                rows.append(line)
+                line = []
+        if line:
+            rows.append(line)
+        return "🔮 Кто заберёт вечер?", InlineKeyboardMarkup(rows)
+
+    async def _handle_prediction_callback(self, query, parts: list[str]) -> None:
+        tournament_id, user_id = int(parts[1]), int(parts[2])
+        if self.storage.has_any_saved_match(tournament_id):
+            await query.answer("Турнир уже начался, прогнозы закрыты.", show_alert=True)
+            return
+        self.storage.cast_prediction(
+            tournament_id=tournament_id, voter_id=query.from_user.id, pick_user_id=user_id
+        )
+        await query.answer("Прогноз принят.")
+        predictions = self.storage.get_predictions(tournament_id)
+        voters = ", ".join(sorted({p["voter_name"] for p in predictions}))
+        base_text = (query.message.text or "").split("\n\nПроголосовали")[0]
+        await query.edit_message_text(
+            f"{base_text}\n\nПроголосовали: {voters}", reply_markup=query.message.reply_markup
+        )
+
+    # -- MVP voting -----------------------------------------------------
+
+    async def _handle_mvp_callback(self, query, parts: list[str]) -> None:
+        tournament_id, user_id = int(parts[1]), int(parts[2])
+        self.storage.cast_mvp_vote(
+            tournament_id=tournament_id, voter_id=query.from_user.id, pick_user_id=user_id
+        )
+        await query.answer("Голос учтён.")
+        tally = self.storage.get_mvp_tally(tournament_id)
+        lines = ["🗳 MVP вечера"]
+        if tally:
+            top_votes = tally[0]["votes"]
+            leaders = [t for t in tally if t["votes"] == top_votes]
+            if len(leaders) == 1:
+                word = "голос" if top_votes == 1 else ("голоса" if top_votes < 5 else "голосов")
+                lines[0] = f"🗳 MVP вечера — {leaders[0]['first_name']} ({top_votes} {word})"
+            lines.append(", ".join(f"{t['first_name']} {t['votes']}" for t in tally))
+        await query.edit_message_text("\n".join(lines), reply_markup=query.message.reply_markup)
+
+    # -- finish tournament -------------------------------------------------
+
+    async def _finish_tournament_flow(self, query, tournament) -> None:
+        tournament_id = tournament["tournament_id"]
+        self.storage.finish_tournament(tournament_id)
+        totals = self.storage.get_tournament_totals(tournament_id)
+        ranked = sort_players(totals)
+        game_label = GAME_LABELS.get(tournament["game"], tournament["game"])
+        match_count = len(self.storage.list_recent_matches(tournament_id, limit=1000))
+
+        medals = ["🥇", "🥈", "🥉"]
+        lines = [f"🏁 Турнир «{tournament['name']}» завершён · {match_count} матчей", ""]
+        for medal, p in zip(medals, ranked):
+            lines.append(f"{medal} {p.first_name} — {p.tops} побед, {p.kills} убийств")
+        await query.edit_message_text("\n".join(lines))
+
+        table_text = format_table(tournament_name=tournament["name"], game_label=game_label, players=totals)
+        await query.message.reply_text(table_text, parse_mode="HTML", do_quote=False)
+
+        kill_pairs = self.storage.get_kill_matrix(tournament_id)
+        matrix_text = format_kill_matrix(totals, kill_pairs)
+        await query.message.reply_text(matrix_text, parse_mode="HTML", do_quote=False)
+
+        titles = pick_titles(totals, kill_pairs)
+        if titles:
+            by_id = {p.user_id: p for p in totals}
+            title_lines = ["🎖 Титулы вечера", ""]
+            for uid, title, detail in titles:
+                player = by_id.get(uid)
+                if player:
+                    title_lines.append(f"{title} — {player.first_name} — {detail}")
+            await query.message.reply_text("\n".join(title_lines), do_quote=False)
+
+        predictions = self.storage.get_predictions(tournament_id)
+        if predictions:
+            champion = ranked[0] if ranked else None
+            hit = [p["voter_name"] for p in predictions if champion and p["pick_user_id"] == champion.user_id]
+            miss = [p["voter_name"] for p in predictions if not champion or p["pick_user_id"] != champion.user_id]
+            pred_lines = ["🔮 Прогнозы"]
+            if hit:
+                pred_lines.append("✅ Угадали: " + ", ".join(hit))
+            if miss:
+                pred_lines.append("❌ Мимо: " + ", ".join(miss))
+            await query.message.reply_text("\n".join(pred_lines), do_quote=False)
+
+        if self.storage.get_setting(query.message.chat.id, "mvp") and len(totals) >= 2:
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton(p.first_name, callback_data=f"mv:{tournament_id}:{p.user_id}")] for p in ranked]
+            )
+            await query.message.reply_text("🗳 Голосуй за MVP вечера:", reply_markup=kb, do_quote=False)
+
+        if self.settings.openai_api_key and totals:
+            status = await query.message.reply_text("🤖 Считаю разбор от GPT...", do_quote=False)
+            await self._run_analyze_for_tournament(tournament, totals, status)
+
+    # -- GPT analysis -----------------------------------------------------
+
+    async def _run_analyze(self, chat_id: int, status_message) -> None:
+        tournament = self._resolve_view_target(chat_id)
+        if tournament is None:
+            await status_message.edit_text("Пока нет турниров для разбора.")
+            return
+        totals = self.storage.get_tournament_totals(tournament["tournament_id"])
+        if not totals:
+            await status_message.edit_text("В этом турнире ещё нет сыгранных матчей.")
+            return
+        await self._run_analyze_for_tournament(tournament, totals, status_message)
+
+    async def _run_analyze_for_tournament(self, tournament, totals, status_message) -> None:
+        kill_pairs = self.storage.get_kill_matrix(tournament["tournament_id"])
+        try:
+            analysis = await asyncio.to_thread(
+                analyze_players, settings=self.settings, players=totals, kill_pairs=kill_pairs
+            )
+        except SummaryError as exc:
+            logger.error("analyze_players failed: %s", exc)
+            await status_message.edit_text(exc.public_message)
+            return
+        text = self._format_analysis(tournament, totals, analysis)
+        await status_message.edit_text(text, parse_mode="HTML")
+
+    def _format_analysis(self, tournament, totals, analysis: dict[int, dict]) -> str:
+        ranked = sort_players(totals)
+        name_width = max([len(p.first_name) for p in ranked] + [5])
+        table_lines = [f"{'Игрок':<{name_width}} {'Хладн.':>7} {'Жёстк.':>7} {'Интел.':>7}"]
+        for p in ranked:
+            a = analysis.get(p.user_id)
+            if not a:
+                continue
+            table_lines.append(
+                f"{p.first_name:<{name_width}} {a['cool_headed']:>7} {a['brutality']:>7} {a['game_iq']:>7}"
+            )
+        lines = [f"📊 Разбор турнира «{tournament['name']}»", "", "<pre>" + "\n".join(table_lines) + "</pre>", ""]
+        lines.append("Выводы:")
+        for p in ranked:
+            a = analysis.get(p.user_id)
+            if a and a.get("verdict"):
+                lines.append(f"• {p.first_name} — {a['verdict']}")
+        lines.append("")
+        lines.append("90-100 Отлично · 75-89 Хорошо · 60-74 Средне · 40-59 Ниже среднего · 0-39 Плохо")
+        return "\n".join(lines)
+
+    # -- tournaments list --------------------------------------------------
+
+    def _render_tournaments_screen(self, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        tournaments = self.storage.list_finished_tournaments(chat_id)
+        if not tournaments:
+            return "Пока нет завершённых турниров.", self._back_to_menu_kb()
+        rows = [[InlineKeyboardButton(t["name"], callback_data=f"tl:{t['tournament_id']}")] for t in tournaments]
+        rows.append([InlineKeyboardButton("← Меню", callback_data="mn:home")])
+        return "🗂 Прошлые турниры", InlineKeyboardMarkup(rows)
+
+    async def _handle_tournaments_callback(self, query, chat_id: int, parts: list[str]) -> None:
+        if parts[1] == "back":
+            await query.answer()
+            text, kb = self._render_tournaments_screen(chat_id)
+            await query.edit_message_text(text, reply_markup=kb)
+            return
+        tournament_id = int(parts[1])
+        tournament = self.storage.get_tournament(tournament_id)
+        if tournament is None:
+            await query.answer("Турнир не найден.", show_alert=True)
+            return
+        totals = self.storage.get_tournament_totals(tournament_id)
+        text = format_table(
+            tournament_name=tournament["name"],
+            game_label=GAME_LABELS.get(tournament["game"], tournament["game"]),
+            players=totals,
+        )
+        await query.answer()
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("← Назад", callback_data="tl:back")]])
+        await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+
+    # -- players -------------------------------------------------------
+
+    def _render_players_screen(self, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        players = self.storage.list_players(chat_id)
+        real = [p for p in players if p.user_id > 0]
+        guests = [p for p in players if p.user_id < 0]
+        lines = ["👥 Игроки", ""]
+        if real:
+            lines.append("Из чата: " + ", ".join(p.first_name for p in real))
+        if guests:
+            lines.append("Добавлены вручную: " + ", ".join(p.first_name for p in guests))
+        if not players:
+            lines.append("Пока никого. Напишите в чат или добавьте вручную.")
+        kb_rows = [[InlineKeyboardButton("➕ Добавить", callback_data="ap:menu")]]
+        if players:
+            kb_rows.append([InlineKeyboardButton("➖ Убрать", callback_data="pl:remove")])
+        kb_rows.append([InlineKeyboardButton("← Меню", callback_data="mn:home")])
+        return "\n".join(lines), InlineKeyboardMarkup(kb_rows)
+
+    async def _handle_players_callback(self, query, chat_id: int, parts: list[str]) -> None:
+        if parts[1] == "remove" and len(parts) == 2:
+            players = self.storage.list_players(chat_id)
+            if not players:
+                await query.answer("Некого убирать.", show_alert=True)
+                return
+            rows = [[InlineKeyboardButton(p.first_name, callback_data=f"pl:remove:{p.user_id}")] for p in players]
+            rows.append([InlineKeyboardButton("← Назад", callback_data="mn:players")])
+            await query.answer()
+            await query.edit_message_text("Кого убрать?", reply_markup=InlineKeyboardMarkup(rows))
+            return
+        if parts[1] == "remove" and len(parts) == 3:
+            user_id = int(parts[2])
+            self.storage.remove_player(chat_id=chat_id, user_id=user_id)
+            await query.answer("Убран.")
+            text, kb = self._render_players_screen(chat_id)
+            await query.edit_message_text(text, reply_markup=kb)
+            return
+
+    async def _handle_add_player_callback(self, query, chat_id: int, parts: list[str]) -> None:
+        origin = parts[1]
+        self.storage.set_pending_input(chat_id=chat_id, user_id=query.from_user.id, kind=f"add_player:{origin}")
+        await query.answer(
+            "Напиши имя одним сообщением в чат. Можно сразу несколько имён через пробел.",
+            show_alert=True,
+        )
+
+    # -- settings ------------------------------------------------------
+
+    def _render_settings_screen(self, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        rows = []
+        for key, label in SETTINGS_LABELS.items():
+            enabled = self.storage.get_setting(chat_id, key)
+            rows.append(
+                [InlineKeyboardButton(f"{label}: {'ВКЛ' if enabled else 'ВЫКЛ'}", callback_data=f"st:toggle:{key}")]
+            )
+        rows.append([InlineKeyboardButton("← Меню", callback_data="mn:home")])
+        return "⚙️ Настройки", InlineKeyboardMarkup(rows)
+
+    async def _handle_settings_callback(self, query, chat_id: int, parts: list[str]) -> None:
+        if parts[1] == "toggle":
+            self.storage.toggle_setting(chat_id, parts[2])
+            await query.answer()
+            text, kb = self._render_settings_screen(chat_id)
+            await query.edit_message_text(text, reply_markup=kb)

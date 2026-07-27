@@ -8,7 +8,6 @@ from telegram.ext import (
     CallbackQueryHandler,
     Defaults,
     MessageHandler,
-    MessageReactionHandler,
     filters,
 )
 
@@ -36,19 +35,8 @@ def build_application() -> Application:
     handlers = BotHandlers(storage=storage, settings=settings)
 
     application.add_handler(MessageHandler(~filters.StatusUpdate.ALL, handlers.on_message))
-    application.add_handler(CallbackQueryHandler(handlers.on_callback_query, pattern=r"^rep:"))
     application.add_handler(
-        MessageReactionHandler(
-            handlers.on_message_reaction,
-            message_reaction_types=MessageReactionHandler.MESSAGE_REACTION_UPDATED,
-        )
-    )
-
-    application.job_queue.run_repeating(
-        handlers.post_weekly_if_due,
-        interval=60,
-        first=10,
-        name="weekly-summary-check",
+        CallbackQueryHandler(handlers.on_callback_query, pattern=r"^(mn|tn|mt|pl|st|tl|pr|mv|ap):")
     )
 
     return application
@@ -56,31 +44,26 @@ def build_application() -> Application:
 
 async def post_init(application: Application) -> None:
     group_commands = [
-        BotCommand("myrating", "твоя статистика"),
-        BotCommand("summary", "промежуточные итоги недели"),
-        BotCommand("rep", "дать +rep или -rep участнику"),
-        BotCommand("catchup", "краткое резюме последних 100 сообщений"),
+        BotCommand("бот", "открыть меню турнирного бота"),
+        BotCommand("table", "таблица турнира"),
+        BotCommand("match", "текущий матч"),
+        BotCommand("league", "лига за всё время"),
+        BotCommand("analyze", "разбор от GPT"),
         BotCommand("about", "что умеет бот"),
     ]
     private_commands = [
         BotCommand("start", "как пользоваться ботом"),
         BotCommand("about", "что умеет бот"),
     ]
-    await application.bot.set_my_commands(
-        group_commands,
-        scope=BotCommandScopeAllGroupChats(),
-    )
-    await application.bot.set_my_commands(
-        private_commands,
-        scope=BotCommandScopeAllPrivateChats(),
-    )
+    await application.bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
+    await application.bot.set_my_commands(private_commands, scope=BotCommandScopeAllPrivateChats())
 
 
 def main() -> None:
     application = build_application()
     logging.getLogger(__name__).info("Bot started")
     application.run_polling(
-        allowed_updates=["message", "message_reaction", "callback_query"],
+        allowed_updates=["message", "callback_query"],
         drop_pending_updates=False,
     )
 
