@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from types import SimpleNamespace
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
 from telegram.constants import ChatType
 from telegram.ext import ContextTypes
 
@@ -72,6 +72,7 @@ class BotHandlers:
             is_bot=user.is_bot,
             seen_at=now.date(),
         )
+        self._register_incidental_users(message, chat.id, now)
 
         text = (message.text or "").strip()
         if not text:
@@ -149,6 +150,29 @@ class BotHandlers:
 
     def _localized(self, dt: datetime) -> datetime:
         return dt.astimezone(self.settings.timezone)
+
+    def _register_incidental_users(self, message, chat_id: int, now: datetime) -> None:
+        """Registers people the bot learns about without them posting themselves:
+        whoever a message replies to, and anyone tagged via a clickable text-mention."""
+        candidates = []
+        reply_user = message.reply_to_message.from_user if message.reply_to_message else None
+        if reply_user is not None:
+            candidates.append(reply_user)
+        for entity in message.entities or ():
+            if entity.type == MessageEntity.TEXT_MENTION and entity.user is not None:
+                candidates.append(entity.user)
+
+        for candidate in candidates:
+            if candidate.is_bot:
+                continue
+            self.storage.register_chat_presence(
+                chat_id=chat_id,
+                user_id=candidate.id,
+                username=candidate.username,
+                first_name=candidate.first_name,
+                is_bot=candidate.is_bot,
+                seen_at=now.date(),
+            )
 
     # -- pending free-text input -------------------------------------------
 
