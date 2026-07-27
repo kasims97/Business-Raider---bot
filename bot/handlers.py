@@ -302,27 +302,10 @@ class BotHandlers:
         rows.append(
             [
                 InlineKeyboardButton("📊 Таблица", callback_data="mn:table"),
-                InlineKeyboardButton("📜 История", callback_data="mn:history"),
-            ]
-        )
-        rows.append(
-            [
-                InlineKeyboardButton("🎖 Лига", callback_data="mn:league"),
-                InlineKeyboardButton("🤖 Разбор", callback_data="mn:analyze"),
-            ]
-        )
-        rows.append(
-            [
                 InlineKeyboardButton("👥 Игроки", callback_data="mn:players"),
-                InlineKeyboardButton("🗂 Прошлые турниры", callback_data="mn:tournaments"),
             ]
         )
-        rows.append(
-            [
-                InlineKeyboardButton("⚙️ Настройки", callback_data="mn:settings"),
-                InlineKeyboardButton("ℹ️ Как этим пользоваться", callback_data="mn:about"),
-            ]
-        )
+        rows.append([InlineKeyboardButton("📜 История", callback_data="mn:history")])
         return "🎮 Турнирный бот", InlineKeyboardMarkup(rows)
 
     def _back_to_menu_kb(self) -> InlineKeyboardMarkup:
@@ -383,9 +366,6 @@ class BotHandlers:
             await query.answer()
             text, kb = self._render_settings_screen(chat_id)
             await query.edit_message_text(text, reply_markup=kb)
-        elif action == "about":
-            await query.answer()
-            await query.edit_message_text(self._about_text(), reply_markup=self._back_to_menu_kb())
         else:
             await query.answer()
 
@@ -395,6 +375,18 @@ class BotHandlers:
             return active
         finished = self.storage.list_finished_tournaments(chat_id, limit=1)
         return finished[0] if finished else None
+
+    def _table_hub_kb(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🎖 Лига", callback_data="mn:league"),
+                    InlineKeyboardButton("🤖 Разбор", callback_data="mn:analyze"),
+                ],
+                [InlineKeyboardButton("⚙️ Настройки", callback_data="mn:settings")],
+                [InlineKeyboardButton("← Меню", callback_data="mn:home")],
+            ]
+        )
 
     def _render_table_view(self, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
         tournament = self._resolve_view_target(chat_id)
@@ -406,7 +398,7 @@ class BotHandlers:
             game_label=GAME_LABELS.get(tournament["game"], tournament["game"]),
             players=totals,
         )
-        return text, self._back_to_menu_kb()
+        return text, self._table_hub_kb()
 
     def _render_history_view(self, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
         tournament = self._resolve_view_target(chat_id)
@@ -448,9 +440,15 @@ class BotHandlers:
         return text, kb
 
     def _render_league_view(self, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🗂 Прошлые турниры", callback_data="mn:tournaments")],
+                [InlineKeyboardButton("← Меню", callback_data="mn:home")],
+            ]
+        )
         totals = self.storage.get_league_totals(chat_id)
         if not totals:
-            return "Лига пока пуста — заверши хотя бы один турнир.", self._back_to_menu_kb()
+            return "Лига пока пуста — заверши хотя бы один турнир.", kb
         ranked = sort_by_league_points(totals)
         finished_count = len(self.storage.list_finished_tournaments(chat_id, limit=1000))
         lines = [f"🎖 Лига · {finished_count} турниров", ""]
@@ -460,7 +458,7 @@ class BotHandlers:
                 f"{i}. {rank} {p.first_name}   {p.league_points} · {p.tops} побед · "
                 f"{p.kills} убийств · KD {format_kd(p.kd)}"
             )
-        return "\n".join(lines), self._back_to_menu_kb()
+        return "\n".join(lines), kb
 
     # -- tournament setup wizard ---------------------------------------------
 
@@ -1029,11 +1027,15 @@ class BotHandlers:
     async def _run_analyze(self, chat_id: int, status_message) -> None:
         tournament = self._resolve_view_target(chat_id)
         if tournament is None:
-            await status_message.edit_text("Пока нет турниров для разбора.")
+            await status_message.edit_text(
+                "Пока нет турниров для разбора.", reply_markup=self._back_to_menu_kb()
+            )
             return
         totals = self.storage.get_tournament_totals(tournament["tournament_id"])
         if not totals:
-            await status_message.edit_text("В этом турнире ещё нет сыгранных матчей.")
+            await status_message.edit_text(
+                "В этом турнире ещё нет сыгранных матчей.", reply_markup=self._back_to_menu_kb()
+            )
             return
         await self._run_analyze_for_tournament(tournament, totals, status_message)
 
@@ -1045,10 +1047,10 @@ class BotHandlers:
             )
         except SummaryError as exc:
             logger.error("analyze_players failed: %s", exc)
-            await status_message.edit_text(exc.public_message)
+            await status_message.edit_text(exc.public_message, reply_markup=self._back_to_menu_kb())
             return
         text = self._format_analysis(tournament, totals, analysis)
-        await status_message.edit_text(text, parse_mode="HTML")
+        await status_message.edit_text(text, parse_mode="HTML", reply_markup=self._back_to_menu_kb())
 
     def _format_analysis(self, tournament, totals, analysis: dict[int, dict]) -> str:
         ranked = sort_players(totals)
