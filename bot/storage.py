@@ -733,6 +733,40 @@ class Storage:
             all_totals.extend(self.get_tournament_totals(tournament_id))
         return merge_totals(all_totals)
 
+    def get_month_stats(self, chat_id: int, year: int, month: int) -> tuple[list[PlayerTotals], int, int]:
+        """Returns (totals, tournament_count, match_count) for tournaments finished in that
+        calendar month, scoped to this chat. Used for the monthly recap post."""
+        month_str = f"{year:04d}-{month:02d}"
+        with self.connect() as conn:
+            tournament_ids = [
+                r["tournament_id"]
+                for r in conn.execute(
+                    """
+                    SELECT tournament_id FROM tournaments
+                    WHERE chat_id = ? AND status = 'finished' AND strftime('%Y-%m', finished_at) = ?
+                    """,
+                    (chat_id, month_str),
+                ).fetchall()
+            ]
+            match_count = 0
+            if tournament_ids:
+                placeholders = ",".join("?" for _ in tournament_ids)
+                match_count = conn.execute(
+                    f"""
+                    SELECT COUNT(*) AS c FROM matches
+                    WHERE tournament_id IN ({placeholders}) AND status = 'saved'
+                    """,
+                    tournament_ids,
+                ).fetchone()["c"]
+        all_totals: list[PlayerTotals] = []
+        for tournament_id in tournament_ids:
+            all_totals.extend(self.get_tournament_totals(tournament_id))
+        return merge_totals(all_totals), len(tournament_ids), match_count
+
+    def list_known_chat_ids(self) -> list[int]:
+        with self.connect() as conn:
+            return [r["chat_id"] for r in conn.execute("SELECT DISTINCT chat_id FROM tournaments").fetchall()]
+
     def list_finished_tournaments(self, chat_id: int, limit: int = 20) -> list[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute(

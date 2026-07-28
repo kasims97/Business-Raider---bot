@@ -17,6 +17,7 @@ from bot.stats import (
     compute_current_streaks,
     format_kd,
     format_kill_matrix,
+    format_monthly_recap,
     format_table,
     league_rank,
     pick_titles,
@@ -497,6 +498,23 @@ class BotHandlers:
                 f"{p.kills} убийств · KD {format_kd(p.kd)}"
             )
         return "\n".join(lines), kb
+
+    async def post_monthly_recap(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Scheduled for the 1st of each month (see bot/main.py) — posts a recap of the
+        previous calendar month to every chat that has finished at least one tournament in it."""
+        now = datetime.now(self.settings.timezone)
+        prev = now.replace(day=1) - timedelta(days=1)
+        for chat_id in self.storage.list_known_chat_ids():
+            totals, tournament_count, match_count = self.storage.get_month_stats(chat_id, prev.year, prev.month)
+            text = format_monthly_recap(
+                month=prev.month, players=totals, tournament_count=tournament_count, match_count=match_count
+            )
+            if text is None:
+                continue
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=text)
+            except Exception:
+                logger.exception("Failed to post monthly recap to chat %s", chat_id)
 
     # -- tournament setup (step by step) --------------------------------------
 

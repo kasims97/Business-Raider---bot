@@ -8,6 +8,7 @@ from telegram import MessageEntity
 
 from bot.config import Settings
 from bot.handlers import BotHandlers
+from bot.stats import PlayerTotals
 
 
 def make_settings() -> Settings:
@@ -194,6 +195,40 @@ class HistoryViewSoloWinnerTests(unittest.TestCase):
         text, _ = self.handlers._render_history_view(chat_id=100)
         self.assertIn("🏆 Ильхам", text)
         self.assertNotIn("🏆 Хан", text)
+
+
+class PostMonthlyRecapTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.storage = MagicMock()
+        self.handlers = BotHandlers(storage=self.storage, settings=make_settings())
+
+    async def test_sends_recap_only_to_chats_with_a_finished_tournament_that_month(self) -> None:
+        self.storage.list_known_chat_ids.return_value = [100, 200]
+        player = PlayerTotals(user_id=1, username=None, first_name="Ильхам", played=5, kills=10, tops=2)
+
+        def month_stats(chat_id, year, month):
+            if chat_id == 100:
+                return [player], 1, 5
+            return [], 0, 0
+
+        self.storage.get_month_stats.side_effect = month_stats
+        context = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+
+        await self.handlers.post_monthly_recap(context)
+
+        context.bot.send_message.assert_called_once()
+        _, kwargs = context.bot.send_message.call_args
+        self.assertEqual(kwargs["chat_id"], 100)
+        self.assertIn("Ильхам", kwargs["text"])
+
+    async def test_no_chats_have_data_sends_nothing(self) -> None:
+        self.storage.list_known_chat_ids.return_value = [100]
+        self.storage.get_month_stats.return_value = ([], 0, 0)
+        context = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+
+        await self.handlers.post_monthly_recap(context)
+
+        context.bot.send_message.assert_not_called()
 
 
 if __name__ == "__main__":

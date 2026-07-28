@@ -4,6 +4,7 @@ from bot.stats import (
     PlayerTotals,
     compute_current_streaks,
     format_kill_matrix,
+    format_monthly_recap,
     format_table,
     league_rank,
     merge_totals,
@@ -90,6 +91,21 @@ class StatsTests(unittest.TestCase):
         text = format_table(tournament_name="Test", game_label="PUBG", players=players)
         self.assertIn("К/М", text)
         self.assertIn("1.3", text)  # 26 kills / 20 matches
+
+    def test_format_monthly_recap_returns_none_when_no_players(self) -> None:
+        self.assertIsNone(
+            format_monthly_recap(month=7, players=[], tournament_count=0, match_count=0)
+        )
+
+    def test_format_monthly_recap_shows_top_player_and_kills_per_match(self) -> None:
+        players = [
+            make_player(1, "Ильхам", played=10, kills=20, tops=5),  # 2.0 kills/match
+            make_player(2, "Касим", played=10, kills=5, tops=1),
+        ]
+        text = format_monthly_recap(month=7, players=players, tournament_count=2, match_count=10)
+        self.assertIn("Итоги июля", text)
+        self.assertIn("Игрок месяца: Ильхам", text)
+        self.assertIn("2.0 уб/матч", text)
 
     def test_format_table_handles_empty(self) -> None:
         text = format_table(tournament_name="Test", game_label="PUBG", players=[])

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import time
 
 from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
 from telegram.ext import (
@@ -37,6 +38,11 @@ def build_application() -> Application:
     application.add_handler(MessageHandler(~filters.StatusUpdate.ALL, handlers.on_message))
     application.add_handler(
         CallbackQueryHandler(handlers.on_callback_query, pattern=r"^(mn|tn|mt|pl|st|tl|pr|mv|ap):")
+    )
+    application.job_queue.run_monthly(
+        handlers.post_monthly_recap,
+        when=time(hour=10, minute=0, tzinfo=settings.timezone),
+        day=1,
     )
 
     return application

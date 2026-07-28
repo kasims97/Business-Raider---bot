@@ -375,6 +375,47 @@ class StorageTests(unittest.TestCase):
         self.storage.save_match_and_advance(tournament_id=tid, match_id=match_id)
         self.assertTrue(self.storage.has_any_saved_match(tid))
 
+    def _set_finished_at(self, tournament_id: int, iso_date: str) -> None:
+        with self.storage.connect() as conn:
+            conn.execute(
+                "UPDATE tournaments SET finished_at = ? WHERE tournament_id = ?", (iso_date, tournament_id)
+            )
+
+    def test_month_stats_only_counts_tournaments_finished_that_month(self) -> None:
+        tid_july = self._setup_solo_tournament()
+        match_id = self.storage.start_tournament(tid_july)
+        self.storage.record_kill(match_id=match_id, killer_id=1, victim_id=2)
+        self.storage.save_match_and_advance(tournament_id=tid_july, match_id=match_id)
+        self.storage.finish_tournament(tid_july)
+        self._set_finished_at(tid_july, "2026-07-15T12:00:00+00:00")
+
+        tid_august = self._setup_solo_tournament()
+        match_id2 = self.storage.start_tournament(tid_august)
+        self.storage.record_kill(match_id=match_id2, killer_id=2, victim_id=1)
+        self.storage.save_match_and_advance(tournament_id=tid_august, match_id=match_id2)
+        self.storage.finish_tournament(tid_august)
+        self._set_finished_at(tid_august, "2026-08-02T12:00:00+00:00")
+
+        totals, tournament_count, match_count = self.storage.get_month_stats(CHAT, 2026, 7)
+        self.assertEqual(tournament_count, 1)
+        self.assertEqual(match_count, 1)
+        self.assertEqual({p.user_id for p in totals}, {1, 2, 3})
+
+        totals_aug, tournament_count_aug, _ = self.storage.get_month_stats(CHAT, 2026, 8)
+        self.assertEqual(tournament_count_aug, 1)
+        self.assertEqual({p.user_id for p in totals_aug}, {1, 2, 3})
+
+        totals_sep, tournament_count_sep, match_count_sep = self.storage.get_month_stats(CHAT, 2026, 9)
+        self.assertEqual(totals_sep, [])
+        self.assertEqual(tournament_count_sep, 0)
+        self.assertEqual(match_count_sep, 0)
+
+    def test_list_known_chat_ids(self) -> None:
+        tid = self._setup_solo_tournament()
+        match_id = self.storage.start_tournament(tid)
+        self.storage.save_match_and_advance(tournament_id=tid, match_id=match_id)
+        self.assertIn(CHAT, self.storage.list_known_chat_ids())
+
 
 if __name__ == "__main__":
     unittest.main()

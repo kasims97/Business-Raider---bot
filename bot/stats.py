@@ -117,6 +117,30 @@ def format_table(*, tournament_name: str, game_label: str, players: list[PlayerT
     return f"🏆 {tournament_name} · {game_label} · матчей: {total_matches}\n\n<pre>{body}</pre>"
 
 
+MONTH_NAMES_RU_GENITIVE = {
+    1: "января", 2: "февраля", 3: "марта", 4: "апреля", 5: "мая", 6: "июня",
+    7: "июля", 8: "августа", 9: "сентября", 10: "октября", 11: "ноября", 12: "декабря",
+}
+
+
+def format_monthly_recap(
+    *, month: int, players: list[PlayerTotals], tournament_count: int, match_count: int
+) -> str | None:
+    if not players:
+        return None
+    ranked = sort_by_league_points(players)
+    lines = [f"📅 Итоги {MONTH_NAMES_RU_GENITIVE[month]} · {tournament_count} турниров · {match_count} матчей", ""]
+    lines.append(f"🏅 Игрок месяца: {ranked[0].first_name}")
+    lines.append("")
+    for i, p in enumerate(ranked, start=1):
+        rank = league_rank(p.league_points)
+        lines.append(
+            f"{i}. {rank} {p.first_name}   {p.league_points} · {p.tops} побед · "
+            f"{p.kills} убийств · {p.kills_per_match:.1f} уб/матч · KD {format_kd(p.kd)}"
+        )
+    return "\n".join(lines)
+
+
 def format_kill_matrix(players: list[PlayerTotals], kill_pairs: dict[tuple[int, int], int]) -> str:
     if not kill_pairs:
         return "⚔️ Кто кого убивал\n\nПока рандомные фраги, никто ещё не запомнился."
