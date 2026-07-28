@@ -60,6 +60,7 @@ class Storage:
                     name TEXT NOT NULL DEFAULT '',
                     game TEXT,
                     team_mode INTEGER,
+                    team_step INTEGER,
                     status TEXT NOT NULL DEFAULT 'setup',
                     created_by INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
@@ -123,11 +124,17 @@ class Storage:
                 """
             )
             self._ensure_pending_input_columns(conn)
+            self._ensure_tournament_columns(conn)
 
     def _ensure_pending_input_columns(self, conn: sqlite3.Connection) -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(pending_input)").fetchall()}
         if "prompt_message_id" not in columns:
             conn.execute("ALTER TABLE pending_input ADD COLUMN prompt_message_id INTEGER")
+
+    def _ensure_tournament_columns(self, conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tournaments)").fetchall()}
+        if "team_step" not in columns:
+            conn.execute("ALTER TABLE tournaments ADD COLUMN team_step INTEGER")
 
     # -- users / presence -------------------------------------------------
 
@@ -237,8 +244,8 @@ class Storage:
             ).fetchone()
 
     def create_setup_draft(self, *, chat_id: int, created_by: int, default_name: str) -> int:
-        """Creates a draft with sensible defaults already applied (PUBG, solo, deduped
-        date-based name) so the setup screen needs zero taps to be startable."""
+        """Creates a draft with only the name pre-filled (deduped against past tournaments
+        in this chat) — game and mode are asked step by step in the wizard."""
         with self.connect() as conn:
             existing = conn.execute(
                 "SELECT tournament_id FROM tournaments WHERE chat_id = ? AND status = 'setup'",
@@ -249,8 +256,8 @@ class Storage:
             name = self._unique_tournament_name(conn, chat_id, default_name)
             cur = conn.execute(
                 """
-                INSERT INTO tournaments (chat_id, name, game, team_mode, status, created_by, created_at)
-                VALUES (?, ?, 'pubg', 0, 'setup', ?, ?)
+                INSERT INTO tournaments (chat_id, name, status, created_by, created_at)
+                VALUES (?, ?, 'setup', ?, ?)
                 """,
                 (chat_id, name, created_by, datetime.now(timezone.utc).isoformat()),
             )
@@ -281,27 +288,44 @@ class Storage:
                 "UPDATE tournaments SET game = ? WHERE tournament_id = ?", (game, tournament_id)
             )
 
-    def set_draft_mode(self, tournament_id: int, team_count: int) -> None:
-        """team_count: 0 = solo, 2-4 = number of teams."""
+    def set_draft_mode(self, tournament_id: int, team_mode: int) -> None:
+        """team_mode: 0 = solo, -1 = team mode chosen (count TBD), 2-4 = finalized count."""
         with self.connect() as conn:
             conn.execute(
                 "UPDATE tournaments SET team_mode = ? WHERE tournament_id = ?",
-                (team_count, tournament_id),
+                (team_mode, tournament_id),
             )
 
-    def toggle_draft_player(self, tournament_id: int, user_id: int, is_team: bool) -> None:
-        """Solo: simple in/out toggle. Team mode: cycles through colors that auto-expand
-        as needed — a new color only unlocks once the previous one is already in use, so
-        a lone tap never jumps straight to team 4."""
+    def set_draft_team_step(self, tournament_id: int, team_step: int) -> None:
         with self.connect() as conn:
-            rows = conn.execute(
-                "SELECT user_id, team FROM tournament_players WHERE tournament_id = ?",
-                (tournament_id,),
-            ).fetchall()
-            current_row = next((r for r in rows if r["user_id"] == user_id), None)
+            conn.execute(
+                "UPDATE tournaments SET team_step = ? WHERE tournament_id = ?", (team_step, tournament_id)
+            )
 
-            if not is_team:
-                if current_row is None:
+    def advance_draft_team_step(self, tournament_id: int) -> int:
+        """Moves on to the next team's roster screen (capped at MAX_TEAMS). Returns the new step."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT team_step FROM tournaments WHERE tournament_id = ?", (tournament_id,)
+            ).fetchone()
+            new_step = min(MAX_TEAMS, (row["team_step"] or 1) + 1)
+            conn.execute(
+                "UPDATE tournaments SET team_step = ? WHERE tournament_id = ?", (new_step, tournament_id)
+            )
+            return new_step
+
+    def toggle_draft_player(self, tournament_id: int, user_id: int, team_step: int) -> None:
+        """team_step 0 = solo: simple in/out toggle. team_step 1-4 = toggle membership in
+        that specific team's roster screen; a player already locked into an earlier team
+        is left untouched (the UI only offers players who aren't locked elsewhere)."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT team FROM tournament_players WHERE tournament_id = ? AND user_id = ?",
+                (tournament_id, user_id),
+            ).fetchone()
+
+            if team_step == 0:
+                if row is None:
                     conn.execute(
                         "INSERT INTO tournament_players (tournament_id, user_id, team) VALUES (?, ?, 0)",
                         (tournament_id, user_id),
@@ -313,24 +337,23 @@ class Storage:
                     )
                 return
 
-            current = current_row["team"] if current_row is not None else 0
-            max_others = max((r["team"] for r in rows if r["user_id"] != user_id), default=0)
-            ceiling = min(MAX_TEAMS, max_others + 1)
-            next_team = current + 1
-            if next_team > ceiling:
+            if row is not None and row["team"] not in (0, team_step):
+                return  # locked into an earlier team already
+
+            if row is not None and row["team"] == team_step:
                 conn.execute(
                     "DELETE FROM tournament_players WHERE tournament_id = ? AND user_id = ?",
                     (tournament_id, user_id),
                 )
-            elif current_row is None:
+            elif row is None:
                 conn.execute(
                     "INSERT INTO tournament_players (tournament_id, user_id, team) VALUES (?, ?, ?)",
-                    (tournament_id, user_id, next_team),
+                    (tournament_id, user_id, team_step),
                 )
             else:
                 conn.execute(
                     "UPDATE tournament_players SET team = ? WHERE tournament_id = ? AND user_id = ?",
-                    (next_team, tournament_id, user_id),
+                    (team_step, tournament_id, user_id),
                 )
 
     def get_draft_players(self, tournament_id: int) -> list[sqlite3.Row]:

@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 GAME_LABELS = {"pubg": "PUBG", "cs": "CS"}
 TEAM_ICONS = {1: "🔴", 2: "🔵", 3: "🟢", 4: "🟡"}
 TEAM_NAMES = {1: "Красные", 2: "Синие", 3: "Зелёные", 4: "Жёлтые"}
+MAX_TEAMS = 4
 
 
 def _team_icon(team: int | None) -> str:
@@ -238,7 +239,8 @@ class BotHandlers:
                 return
             name = message.text.strip()[:60] or "Без названия"
             self.storage.set_draft_name(draft["tournament_id"], name)
-            text, kb = self._render_setup_screen(chat.id, draft["tournament_id"])
+            draft = self.storage.get_tournament(draft["tournament_id"])
+            text, kb = self._render_wizard_step(draft, chat.id)
             await message.reply_text(f"✅ Название: {name}\n\n{text}", reply_markup=kb, do_quote=False)
             return
 
@@ -257,7 +259,7 @@ class BotHandlers:
             if origin == "setup":
                 draft = self.storage.get_setup_draft(chat.id)
                 if draft is not None:
-                    text, kb = self._render_setup_screen(chat.id, draft["tournament_id"])
+                    text, kb = self._render_wizard_step(draft, chat.id)
                     await message.reply_text(f"{confirmation}\n\n{text}", reply_markup=kb, do_quote=False)
             elif origin == "roster":
                 tournament = self.storage.get_active_tournament(chat.id)
@@ -496,7 +498,7 @@ class BotHandlers:
             )
         return "\n".join(lines), kb
 
-    # -- tournament setup (single screen) ------------------------------------
+    # -- tournament setup (step by step) --------------------------------------
 
     async def _start_or_resume_setup(self, query, chat_id: int) -> None:
         draft = self.storage.get_setup_draft(chat_id)
@@ -509,48 +511,62 @@ class BotHandlers:
             tournament_id = self.storage.create_setup_draft(
                 chat_id=chat_id, created_by=query.from_user.id, default_name=default_name
             )
-        else:
-            tournament_id = draft["tournament_id"]
+            draft = self.storage.get_tournament(tournament_id)
         await query.answer()
-        text, kb = self._render_setup_screen(chat_id, tournament_id)
+        text, kb = self._render_wizard_step(draft, chat_id)
         await query.edit_message_text(text, reply_markup=kb)
 
-    def _render_setup_screen(self, chat_id: int, tournament_id: int) -> tuple[str, InlineKeyboardMarkup]:
-        draft = self.storage.get_tournament(tournament_id)
-        is_team = draft["team_mode"] != 0
+    def _render_wizard_step(self, draft, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        if not draft["game"]:
+            return self._render_game_step(draft)
+        if draft["team_mode"] is None:
+            return self._render_mode_step(draft)
+        if draft["team_mode"] == 0:
+            return self._render_solo_roster_step(chat_id, draft)
+        return self._render_team_roster_step(chat_id, draft, draft["team_step"] or 1)
+
+    def _render_game_step(self, draft) -> tuple[str, InlineKeyboardMarkup]:
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("PUBG", callback_data="tn:game:pubg"),
+                    InlineKeyboardButton("CS", callback_data="tn:game:cs"),
+                ],
+                [
+                    InlineKeyboardButton("✏️ Название", callback_data="tn:name:custom"),
+                    InlineKeyboardButton("🗑 Отмена", callback_data="tn:cancel"),
+                ],
+            ]
+        )
+        return f"🏆 {draft['name']}\n\nИгра?", kb
+
+    def _render_mode_step(self, draft) -> tuple[str, InlineKeyboardMarkup]:
+        game_label = GAME_LABELS.get(draft["game"], draft["game"])
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Соло — каждый сам за себя", callback_data="tn:mode:solo")],
+                [InlineKeyboardButton("Командами", callback_data="tn:mode:team")],
+                [InlineKeyboardButton("🗑 Отмена", callback_data="tn:cancel")],
+            ]
+        )
+        return f"🏆 {draft['name']} · {game_label}\n\nКак играем?", kb
+
+    def _render_solo_roster_step(self, chat_id: int, draft) -> tuple[str, InlineKeyboardMarkup]:
+        tournament_id = draft["tournament_id"]
         all_players = self.storage.list_players(chat_id)
-        selected = {r["user_id"]: r["team"] for r in self.storage.get_draft_players(tournament_id)}
+        selected = {r["user_id"] for r in self.storage.get_draft_players(tournament_id)}
 
-        rows: list[list[InlineKeyboardButton]] = [
-            [
-                InlineKeyboardButton(
-                    ("✅ " if draft["game"] == "pubg" else "") + "PUBG", callback_data="tn:game:pubg"
-                ),
-                InlineKeyboardButton(("✅ " if draft["game"] == "cs" else "") + "CS", callback_data="tn:game:cs"),
-            ],
-            [
-                InlineKeyboardButton(("✅ " if not is_team else "") + "Соло", callback_data="tn:mode:solo"),
-                InlineKeyboardButton(("✅ " if is_team else "") + "Командами", callback_data="tn:mode:team"),
-            ],
-        ]
-
+        rows: list[list[InlineKeyboardButton]] = []
         line: list[InlineKeyboardButton] = []
         for p in all_players:
-            team = selected.get(p.user_id)
-            label = f"{_team_icon(team) if is_team else ('✅' if team is not None else '⬜')} {p.first_name}"
+            label = f"{'✅' if p.user_id in selected else '⬜'} {p.first_name}"
             line.append(InlineKeyboardButton(label, callback_data=f"tn:p:{p.user_id}"))
             if len(line) == 2:
                 rows.append(line)
                 line = []
         if line:
             rows.append(line)
-
-        rows.append(
-            [
-                InlineKeyboardButton("➕ Игрок", callback_data="ap:setup"),
-                InlineKeyboardButton("✏️ Название", callback_data="tn:name:custom"),
-            ]
-        )
+        rows.append([InlineKeyboardButton("➕ Игрок", callback_data="ap:setup")])
         rows.append(
             [
                 InlineKeyboardButton("🚀 Начать", callback_data="tn:start"),
@@ -558,14 +574,47 @@ class BotHandlers:
             ]
         )
 
-        note = (
-            "Тапай по имени: цвет команды назначается по очереди, новый цвет открывается по мере надобности."
-            if is_team
-            else "Тапай по имени, чтобы включить/выключить."
-        )
-        text = f"🏆 Новый турнир · {draft['name']}\n\n{note}"
+        game_label = GAME_LABELS.get(draft["game"], draft["game"])
+        text = f"🏆 {draft['name']} · {game_label} · Соло\n\nКто играет? Тапай, чтобы включить/выключить."
         if not all_players:
             text += "\n\nПока никого не знаю — напиши что-нибудь в чат или добавь игрока вручную."
+        return text, InlineKeyboardMarkup(rows)
+
+    def _render_team_roster_step(self, chat_id: int, draft, team_step: int) -> tuple[str, InlineKeyboardMarkup]:
+        tournament_id = draft["tournament_id"]
+        assigned = self.storage.get_draft_players(tournament_id)
+        locked_elsewhere = {p["user_id"] for p in assigned if p["team"] != team_step}
+        selected_here = {p["user_id"] for p in assigned if p["team"] == team_step}
+        candidates = [p for p in self.storage.list_players(chat_id) if p.user_id not in locked_elsewhere]
+
+        rows: list[list[InlineKeyboardButton]] = []
+        line: list[InlineKeyboardButton] = []
+        for p in candidates:
+            label = f"{'✅' if p.user_id in selected_here else '⬜'} {p.first_name}"
+            line.append(InlineKeyboardButton(label, callback_data=f"tn:p:{p.user_id}"))
+            if len(line) == 2:
+                rows.append(line)
+                line = []
+        if line:
+            rows.append(line)
+        rows.append([InlineKeyboardButton("➕ Игрок", callback_data="ap:setup")])
+
+        nav_row = []
+        if team_step < MAX_TEAMS:
+            nav_row.append(InlineKeyboardButton(f"▶️ Команда {team_step + 1}", callback_data="tn:team_next"))
+        if team_step >= 2:
+            nav_row.append(InlineKeyboardButton("🚀 Начать", callback_data="tn:start"))
+        if nav_row:
+            rows.append(nav_row)
+        rows.append([InlineKeyboardButton("🗑 Отмена", callback_data="tn:cancel")])
+
+        game_label = GAME_LABELS.get(draft["game"], draft["game"])
+        text = (
+            f"🏆 {draft['name']} · {game_label} · Командами\n\n"
+            f"{_team_icon(team_step)} Команда {team_step}: кто играет?"
+        )
+        if not candidates:
+            text += "\n\nБольше некого позвать — все уже в других командах. Можно добавить нового игрока."
         return text, InlineKeyboardMarkup(rows)
 
     async def _handle_setup_callback(self, query, chat_id: int, parts: list[str]) -> None:
@@ -589,22 +638,43 @@ class BotHandlers:
         if action == "game":
             self.storage.set_draft_game(tournament_id, parts[2])
             await query.answer()
-            text, kb = self._render_setup_screen(chat_id, tournament_id)
+            draft = self.storage.get_tournament(tournament_id)
+            text, kb = self._render_wizard_step(draft, chat_id)
             await query.edit_message_text(text, reply_markup=kb)
             return
 
         if action == "mode":
-            self.storage.set_draft_mode(tournament_id, 0 if parts[2] == "solo" else -1)
+            if parts[2] == "solo":
+                self.storage.set_draft_mode(tournament_id, 0)
+            else:
+                self.storage.set_draft_mode(tournament_id, -1)
+                self.storage.set_draft_team_step(tournament_id, 1)
             await query.answer()
-            text, kb = self._render_setup_screen(chat_id, tournament_id)
+            draft = self.storage.get_tournament(tournament_id)
+            text, kb = self._render_wizard_step(draft, chat_id)
             await query.edit_message_text(text, reply_markup=kb)
             return
 
         if action == "p":
             user_id = int(parts[2])
-            self.storage.toggle_draft_player(tournament_id, user_id, draft["team_mode"] != 0)
+            team_step = 0 if draft["team_mode"] == 0 else (draft["team_step"] or 1)
+            self.storage.toggle_draft_player(tournament_id, user_id, team_step)
             await query.answer()
-            text, kb = self._render_setup_screen(chat_id, tournament_id)
+            draft = self.storage.get_tournament(tournament_id)
+            text, kb = self._render_wizard_step(draft, chat_id)
+            await query.edit_message_text(text, reply_markup=kb)
+            return
+
+        if action == "team_next":
+            current_step = draft["team_step"] or 1
+            has_someone = any(p["team"] == current_step for p in self.storage.get_draft_players(tournament_id))
+            if not has_someone:
+                await query.answer("Добавь хотя бы одного игрока в эту команду.", show_alert=True)
+                return
+            self.storage.advance_draft_team_step(tournament_id)
+            await query.answer()
+            draft = self.storage.get_tournament(tournament_id)
+            text, kb = self._render_wizard_step(draft, chat_id)
             await query.edit_message_text(text, reply_markup=kb)
             return
 
