@@ -465,33 +465,38 @@ class Storage:
                 )
 
     def record_kill(self, *, match_id: int, killer_id: int, victim_id: int | None) -> None:
+        """killer_id=0 is the sentinel for "no one" — a death not caused by one of the
+        tracked players (zone, fall, an outside enemy). Either way, a real victim_id
+        eliminates that player from the live match (match_players.top flips to 1;
+        the field means "eliminated", not "won" — the winner is whoever's left)."""
         with self.connect() as conn:
             conn.execute(
                 "INSERT INTO kills (match_id, killer_id, victim_id, created_at) VALUES (?, ?, ?, ?)",
                 (match_id, killer_id, victim_id, datetime.now(timezone.utc).isoformat()),
             )
+            if victim_id is not None:
+                conn.execute(
+                    "UPDATE match_players SET top = 1 WHERE match_id = ? AND user_id = ?",
+                    (match_id, victim_id),
+                )
 
-    def undo_last_kill(self, *, match_id: int, killer_id: int) -> bool:
+    def undo_last_action(self, *, match_id: int) -> sqlite3.Row | None:
+        """Reverts the single most recent kill/elimination in this match, whoever
+        recorded it, and un-eliminates the victim if there was one."""
         with self.connect() as conn:
             row = conn.execute(
-                """
-                SELECT kill_id FROM kills
-                WHERE match_id = ? AND killer_id = ?
-                ORDER BY kill_id DESC LIMIT 1
-                """,
-                (match_id, killer_id),
+                "SELECT kill_id, killer_id, victim_id FROM kills WHERE match_id = ? ORDER BY kill_id DESC LIMIT 1",
+                (match_id,),
             ).fetchone()
             if row is None:
-                return False
+                return None
             conn.execute("DELETE FROM kills WHERE kill_id = ?", (row["kill_id"],))
-            return True
-
-    def toggle_top(self, *, match_id: int, user_id: int) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                "UPDATE match_players SET top = 1 - top WHERE match_id = ? AND user_id = ?",
-                (match_id, user_id),
-            )
+            if row["victim_id"] is not None:
+                conn.execute(
+                    "UPDATE match_players SET top = 0 WHERE match_id = ? AND user_id = ?",
+                    (match_id, row["victim_id"]),
+                )
+            return row
 
     def set_winner_team(self, *, match_id: int, team: int) -> None:
         with self.connect() as conn:
@@ -601,7 +606,9 @@ class Storage:
             if row["team"] > 0:
                 won = row["team"] == winner_by_match[row["match_id"]]
             else:
-                won = row["top"] == 1
+                # top now means "eliminated" (set on kill/zone-death) — surviving to the
+                # end (top == 0) is what counts as a win.
+                won = row["top"] == 0
             if won:
                 tops[row["user_id"]] += 1
 
@@ -644,7 +651,8 @@ class Storage:
                 SELECT k.killer_id, k.victim_id, COUNT(*) AS c
                 FROM kills k
                 JOIN matches m ON m.match_id = k.match_id
-                WHERE m.tournament_id = ? AND m.status = 'saved' AND k.victim_id IS NOT NULL
+                WHERE m.tournament_id = ? AND m.status = 'saved'
+                  AND k.victim_id IS NOT NULL AND k.killer_id != 0
                 GROUP BY k.killer_id, k.victim_id
                 """,
                 (tournament_id,),
@@ -672,7 +680,7 @@ class Storage:
                     if row["team"] > 0:
                         entry[row["user_id"]] = row["team"] == m["winner_team"]
                     else:
-                        entry[row["user_id"]] = row["top"] == 1
+                        entry[row["user_id"]] = row["top"] == 0
                 result.append(entry)
         return result
 

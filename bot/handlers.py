@@ -722,7 +722,8 @@ class BotHandlers:
     def _render_scoreboard(self, match_id: int) -> tuple[str, InlineKeyboardMarkup]:
         match = self.storage.get_match(match_id)
         tournament = self.storage.get_tournament(match["tournament_id"])
-        players = sorted(self.storage.get_match_players(match_id), key=lambda r: r["first_name"])
+        all_players = sorted(self.storage.get_match_players(match_id), key=lambda r: r["first_name"])
+        alive = [p for p in all_players if p["top"] == 0]
         game_label = GAME_LABELS.get(tournament["game"], tournament["game"])
         mode_label = "командами" if tournament["team_mode"] else "соло"
         header = f"🏆 {tournament['name']} · {game_label} {mode_label}\nМатч #{match['match_no']}"
@@ -730,44 +731,35 @@ class BotHandlers:
         team_count = tournament["team_mode"]
         rows: list[list[InlineKeyboardButton]] = []
         if team_count == 0:
-            lines = [f"{p['first_name']:<12} {p['kills']} убийств" + (" · 🏆" if p["top"] else "") for p in players]
-            for p in players:
-                rows.append(
-                    [
-                        InlineKeyboardButton(f"➕ {p['first_name']}", callback_data=f"mt:kill:{p['user_id']}"),
-                        InlineKeyboardButton("−", callback_data=f"mt:undo:{p['user_id']}"),
-                        InlineKeyboardButton("🏆" if p["top"] else "⬜", callback_data=f"mt:top:{p['user_id']}"),
-                    ]
-                )
+            lines = [f"{p['first_name']:<12} {p['kills']} убийств" for p in alive]
         else:
-            winner = match["winner_team"]
             lines = []
             for t in range(1, team_count + 1):
-                team_players = [p for p in players if p["team"] == t]
-                lines.append(f"{_team_icon(t)} {_team_name(t)}" + (" 🏆" if winner == t else ""))
+                team_players = [p for p in alive if p["team"] == t]
+                if not team_players:
+                    continue
+                lines.append(f"{_team_icon(t)} {_team_name(t)}")
                 lines += [f"{p['first_name']:<12} {p['kills']} убийств" for p in team_players]
                 lines.append("")
-            lines.pop()  # drop trailing blank line
-            for p in players:
-                rows.append(
-                    [
-                        InlineKeyboardButton(f"➕ {p['first_name']}", callback_data=f"mt:kill:{p['user_id']}"),
-                        InlineKeyboardButton("−", callback_data=f"mt:undo:{p['user_id']}"),
-                    ]
-                )
-            win_row = [
-                InlineKeyboardButton(f"🏆 {_team_icon(t)} Победа", callback_data=f"mt:win:{t}")
-                for t in range(1, team_count + 1)
-            ]
-            rows.append(win_row)
+            if lines:
+                lines.pop()  # drop trailing blank line
+
+        for p in alive:
+            rows.append(
+                [
+                    InlineKeyboardButton(f"➕ {p['first_name']}", callback_data=f"mt:kill:{p['user_id']}"),
+                    InlineKeyboardButton("−", callback_data=f"mt:died:{p['user_id']}"),
+                ]
+            )
         rows.append([InlineKeyboardButton("✅ Матч сыгран", callback_data="mt:save")])
+        rows.append([InlineKeyboardButton("↩️ Отменить последнее", callback_data="mt:undo_last")])
         rows.append(
             [
                 InlineKeyboardButton("👥 Состав", callback_data="mt:roster"),
                 InlineKeyboardButton("🏁 Завершить турнир", callback_data="mt:finish"),
             ]
         )
-        body = "<pre>" + "\n".join(lines) + "</pre>" if lines else "Пока никого в составе."
+        body = "<pre>" + "\n".join(lines) + "</pre>" if lines else "Все выбыли."
         return f"{header}\n\n{body}", InlineKeyboardMarkup(rows)
 
     def _render_victim_picker(self, match_id: int, killer_id: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -775,12 +767,13 @@ class BotHandlers:
         tournament = self.storage.get_tournament(match["tournament_id"])
         players = self.storage.get_match_players(match_id)
         killer = next((p for p in players if p["user_id"] == killer_id), None)
-        if killer is None:
+        if killer is None or killer["top"] == 1:
             return self._render_scoreboard(match_id)
+        alive = [p for p in players if p["top"] == 0]
         if tournament["team_mode"]:
-            candidates = [p for p in players if p["team"] != killer["team"]]
+            candidates = [p for p in alive if p["team"] != killer["team"]]
         else:
-            candidates = [p for p in players if p["user_id"] != killer_id]
+            candidates = [p for p in alive if p["user_id"] != killer_id]
 
         rows: list[list[InlineKeyboardButton]] = []
         line: list[InlineKeyboardButton] = []
@@ -796,6 +789,34 @@ class BotHandlers:
 
         team_note = f" ({_team_icon(killer['team'])})" if tournament["team_mode"] else ""
         return f"Кого убил {killer['first_name']}{team_note}?", InlineKeyboardMarkup(rows)
+
+    def _render_killer_picker(self, match_id: int, victim_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        match = self.storage.get_match(match_id)
+        tournament = self.storage.get_tournament(match["tournament_id"])
+        players = self.storage.get_match_players(match_id)
+        victim = next((p for p in players if p["user_id"] == victim_id), None)
+        if victim is None or victim["top"] == 1:
+            return self._render_scoreboard(match_id)
+        alive = [p for p in players if p["top"] == 0]
+        if tournament["team_mode"]:
+            candidates = [p for p in alive if p["team"] != victim["team"]]
+        else:
+            candidates = [p for p in alive if p["user_id"] != victim_id]
+
+        rows: list[list[InlineKeyboardButton]] = []
+        line: list[InlineKeyboardButton] = []
+        for c in candidates:
+            line.append(InlineKeyboardButton(c["first_name"], callback_data=f"mt:killer:{victim_id}:{c['user_id']}"))
+            if len(line) == 2:
+                rows.append(line)
+                line = []
+        if line:
+            rows.append(line)
+        rows.append([InlineKeyboardButton("🌀 Зона / падение", callback_data=f"mt:zone:{victim_id}")])
+        rows.append([InlineKeyboardButton("← Назад", callback_data="mt:back")])
+
+        team_note = f" ({_team_icon(victim['team'])})" if tournament["team_mode"] else ""
+        return f"От кого умер {victim['first_name']}{team_note}?", InlineKeyboardMarkup(rows)
 
     def _render_match_roster(self, match_id: int, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
         match = self.storage.get_match(match_id)
@@ -821,6 +842,17 @@ class BotHandlers:
         rows.append([InlineKeyboardButton("✅ Готово", callback_data="mt:roster:done")])
         return "Кто играет сейчас?", InlineKeyboardMarkup(rows)
 
+    def _auto_set_team_winner(self, match_id: int, tournament) -> None:
+        """Called right before saving a team match: if exactly one team still has a
+        survivor, that's the winner. Ambiguous (0 or 2+ teams alive — the match was
+        ended early) leaves winner_team unset, same as forgetting to pick one before."""
+        if not tournament["team_mode"]:
+            return
+        players = self.storage.get_match_players(match_id)
+        alive_teams = {p["team"] for p in players if p["top"] == 0}
+        if len(alive_teams) == 1:
+            self.storage.set_winner_team(match_id=match_id, team=next(iter(alive_teams)))
+
     def _build_match_recap(self, match_id: int) -> str:
         match = self.storage.get_match(match_id)
         tournament = self.storage.get_tournament(match["tournament_id"])
@@ -835,8 +867,8 @@ class BotHandlers:
             )
             header = f"Матч #{match['match_no']} · 🏆 {winner}"
         else:
-            winners = [p["first_name"] for p in players if p["top"]]
-            header = f"Матч #{match['match_no']} · 🏆 {', '.join(winners) if winners else 'нет топа'}"
+            winners = [p["first_name"] for p in players if p["top"] == 0]
+            header = f"Матч #{match['match_no']} · 🏆 {', '.join(winners) if winners else 'нет победителя'}"
 
         by_killer: dict[str, list[str]] = {}
         for k in kills:
@@ -895,26 +927,32 @@ class BotHandlers:
             await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
             return
 
-        if action == "undo":
-            user_id = int(parts[2])
-            ok = self.storage.undo_last_kill(match_id=match_id, killer_id=user_id)
-            await query.answer("Отменено." if ok else "Нечего отменять.")
-            text, kb = self._render_scoreboard(match_id)
-            await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
-            return
-
-        if action == "top":
-            user_id = int(parts[2])
-            self.storage.toggle_top(match_id=match_id, user_id=user_id)
+        if action == "died":
+            victim_id = int(parts[2])
             await query.answer()
+            text, kb = self._render_killer_picker(match_id, victim_id)
+            await query.edit_message_text(text, reply_markup=kb)
+            return
+
+        if action == "killer":
+            victim_id, killer_id = int(parts[2]), int(parts[3])
+            self.storage.record_kill(match_id=match_id, killer_id=killer_id, victim_id=victim_id)
+            await query.answer("Записано.")
             text, kb = self._render_scoreboard(match_id)
             await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
             return
 
-        if action == "win":
-            team = int(parts[2])
-            self.storage.set_winner_team(match_id=match_id, team=team)
-            await query.answer(f"Победила команда {'А' if team == 1 else 'Б'}.")
+        if action == "zone":
+            victim_id = int(parts[2])
+            self.storage.record_kill(match_id=match_id, killer_id=0, victim_id=victim_id)
+            await query.answer("Отмечено: выбыл без убийцы.")
+            text, kb = self._render_scoreboard(match_id)
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+            return
+
+        if action == "undo_last":
+            undone = self.storage.undo_last_action(match_id=match_id)
+            await query.answer("Отменено." if undone is not None else "Нечего отменять.")
             text, kb = self._render_scoreboard(match_id)
             await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
             return
@@ -939,6 +977,7 @@ class BotHandlers:
                 return
 
         if action == "save":
+            self._auto_set_team_winner(match_id, tournament)
             new_match_id = self.storage.save_match_and_advance(
                 tournament_id=tournament["tournament_id"], match_id=match_id
             )

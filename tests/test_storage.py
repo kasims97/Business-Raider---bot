@@ -78,7 +78,6 @@ class StorageTests(unittest.TestCase):
         tid = self._setup_solo_tournament()
         match_id = self.storage.start_tournament(tid)
         self.storage.record_kill(match_id=match_id, killer_id=1, victim_id=2)
-        self.storage.toggle_top(match_id=match_id, user_id=1)
         totals = self.storage.get_tournament_totals(tid)
         self.assertEqual(totals, [])  # nothing saved yet
 
@@ -87,7 +86,7 @@ class StorageTests(unittest.TestCase):
         match_id = self.storage.start_tournament(tid)
         self.storage.record_kill(match_id=match_id, killer_id=1, victim_id=2)
         self.storage.record_kill(match_id=match_id, killer_id=1, victim_id=3)
-        self.storage.toggle_top(match_id=match_id, user_id=1)
+        # player 1 was never eliminated, so they're the automatic survivor/winner
         new_match_id = self.storage.save_match_and_advance(tournament_id=tid, match_id=match_id)
         self.assertNotEqual(new_match_id, match_id)
 
@@ -102,27 +101,45 @@ class StorageTests(unittest.TestCase):
         # roster carried over into the new live match
         new_players = {p["user_id"] for p in self.storage.get_match_players(new_match_id)}
         self.assertEqual(new_players, {1, 2, 3})
-        # fresh match starts with zero kills/tops regardless of previous match
+        # fresh match starts with everyone alive regardless of the previous match
         for p in self.storage.get_match_players(new_match_id):
             self.assertEqual(p["kills"], 0)
             self.assertEqual(p["top"], 0)
 
-    def test_undo_kill_removes_most_recent_only(self) -> None:
+    def test_undo_last_action_removes_most_recent_kill_and_revives_victim(self) -> None:
         tid = self._setup_solo_tournament()
         match_id = self.storage.start_tournament(tid)
         self.storage.record_kill(match_id=match_id, killer_id=1, victim_id=2)
         self.storage.record_kill(match_id=match_id, killer_id=1, victim_id=3)
-        ok = self.storage.undo_last_kill(match_id=match_id, killer_id=1)
-        self.assertTrue(ok)
-        rows = self.storage.get_match_players(match_id)
-        killer_row = next(r for r in rows if r["user_id"] == 1)
-        self.assertEqual(killer_row["kills"], 1)
+        undone = self.storage.undo_last_action(match_id=match_id)
+        self.assertIsNotNone(undone)
+        rows = {r["user_id"]: r for r in self.storage.get_match_players(match_id)}
+        self.assertEqual(rows[1]["kills"], 1)  # only the first kill remains
+        self.assertEqual(rows[3]["top"], 0)  # revived — that kill was undone
+        self.assertEqual(rows[2]["top"], 1)  # untouched, still eliminated
 
-    def test_undo_kill_with_nothing_to_undo(self) -> None:
+    def test_undo_last_action_with_nothing_to_undo(self) -> None:
         tid = self._setup_solo_tournament()
         match_id = self.storage.start_tournament(tid)
-        ok = self.storage.undo_last_kill(match_id=match_id, killer_id=1)
-        self.assertFalse(ok)
+        self.assertIsNone(self.storage.undo_last_action(match_id=match_id))
+
+    def test_zone_death_eliminates_without_crediting_a_kill(self) -> None:
+        tid = self._setup_solo_tournament()
+        match_id = self.storage.start_tournament(tid)
+        self.storage.record_kill(match_id=match_id, killer_id=0, victim_id=2)
+        rows = {r["user_id"]: r for r in self.storage.get_match_players(match_id)}
+        self.assertEqual(rows[2]["top"], 1)
+        self.assertEqual(rows[2]["kills"], 0)
+        self.assertEqual(rows[1]["kills"], 0)  # no one credited
+
+    def test_undo_last_action_reverts_a_zone_death(self) -> None:
+        tid = self._setup_solo_tournament()
+        match_id = self.storage.start_tournament(tid)
+        self.storage.record_kill(match_id=match_id, killer_id=0, victim_id=2)
+        undone = self.storage.undo_last_action(match_id=match_id)
+        self.assertIsNotNone(undone)
+        rows = {r["user_id"]: r for r in self.storage.get_match_players(match_id)}
+        self.assertEqual(rows[2]["top"], 0)
 
     def test_random_kill_has_no_victim_and_is_excluded_from_matrix(self) -> None:
         tid = self._setup_solo_tournament()
@@ -295,10 +312,10 @@ class StorageTests(unittest.TestCase):
         self.storage.record_kill(match_id=match_id, killer_id=1, victim_id=2)
         self.assertTrue(self.storage.match_has_progress(match_id))
 
-    def test_match_has_progress_true_after_top(self) -> None:
+    def test_match_has_progress_true_after_zone_death(self) -> None:
         tid = self._setup_solo_tournament()
         match_id = self.storage.start_tournament(tid)
-        self.storage.toggle_top(match_id=match_id, user_id=1)
+        self.storage.record_kill(match_id=match_id, killer_id=0, victim_id=1)
         self.assertTrue(self.storage.match_has_progress(match_id))
 
     def test_match_has_progress_true_after_team_win_set(self) -> None:
@@ -318,9 +335,10 @@ class StorageTests(unittest.TestCase):
     def test_match_results_sequence_reflects_top_and_team_wins(self) -> None:
         tid = self._setup_solo_tournament()
         match1 = self.storage.start_tournament(tid)
-        self.storage.toggle_top(match_id=match1, user_id=1)
+        # player 1 survives (never eliminated), player 2 is killed off
+        self.storage.record_kill(match_id=match1, killer_id=1, victim_id=2)
         match2 = self.storage.save_match_and_advance(tournament_id=tid, match_id=match1)
-        self.storage.toggle_top(match_id=match2, user_id=1)
+        self.storage.record_kill(match_id=match2, killer_id=1, victim_id=2)
         self.storage.save_match_and_advance(tournament_id=tid, match_id=match2)
 
         sequence = self.storage.get_match_results_sequence(tid)
