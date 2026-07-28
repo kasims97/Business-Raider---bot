@@ -29,9 +29,12 @@ from bot.storage import Storage
 logger = logging.getLogger(__name__)
 
 GAME_LABELS = {"pubg": "PUBG", "cs": "CS"}
-TEAM_ICONS = {1: "🔴", 2: "🔵", 3: "🟢", 4: "🟡"}
-TEAM_NAMES = {1: "Красные", 2: "Синие", 3: "Зелёные", 4: "Жёлтые"}
-MAX_TEAMS = 4
+TEAM_ICONS = {1: "🔴", 2: "🔵", 3: "🟢", 4: "🟡", 5: "🟣", 6: "🟠", 7: "⚫", 8: "⚪"}
+TEAM_NAMES = {
+    1: "Красные", 2: "Синие", 3: "Зелёные", 4: "Жёлтые",
+    5: "Фиолетовые", 6: "Оранжевые", 7: "Чёрные", 8: "Белые",
+}
+MAX_TEAMS = 8
 
 
 def _team_icon(team: int | None) -> str:
@@ -857,8 +860,13 @@ class BotHandlers:
         if line:
             rows.append(line)
         rows.append([InlineKeyboardButton("➕ Добавить игрока", callback_data="ap:roster")])
+        if team_count and team_count < MAX_TEAMS:
+            rows.append([InlineKeyboardButton("➕ Новая команда", callback_data="mt:roster:new_team")])
         rows.append([InlineKeyboardButton("✅ Готово", callback_data="mt:roster:done")])
-        return "Кто играет сейчас?", InlineKeyboardMarkup(rows)
+        text = "Кто играет сейчас?"
+        if team_count:
+            text += " Тапай по имени, чтобы переключить между командами."
+        return text, InlineKeyboardMarkup(rows)
 
     def _auto_set_team_winner(self, match_id: int, tournament) -> None:
         """Called right before saving a team match: if exactly one team still has a
@@ -985,6 +993,12 @@ class BotHandlers:
                 user_id = int(parts[3])
                 self.storage.toggle_match_roster(match_id, user_id, tournament["team_mode"])
                 await query.answer()
+                text, kb = self._render_match_roster(match_id, chat_id)
+                await query.edit_message_text(text, reply_markup=kb)
+                return
+            if parts[2] == "new_team":
+                new_team = self.storage.add_tournament_team(tournament["tournament_id"])
+                await query.answer(f"Добавлена команда {new_team}.")
                 text, kb = self._render_match_roster(match_id, chat_id)
                 await query.edit_message_text(text, reply_markup=kb)
                 return
@@ -1303,7 +1317,7 @@ class BotHandlers:
             return
 
     async def _handle_add_player_callback(self, query, chat_id: int, parts: list[str]) -> None:
-        origin = parts[1]
+        origin = ":".join(parts[1:])
         await query.answer()
         prompt = await self._send_force_reply_prompt(
             query.message,

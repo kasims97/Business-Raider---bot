@@ -11,7 +11,7 @@ from typing import Iterator
 from bot.stats import PlayerTotals, merge_totals
 
 PENDING_INPUT_TTL = timedelta(minutes=10)
-MAX_TEAMS = 4
+MAX_TEAMS = 8
 
 
 class Storage:
@@ -289,7 +289,7 @@ class Storage:
             )
 
     def set_draft_mode(self, tournament_id: int, team_mode: int) -> None:
-        """team_mode: 0 = solo, -1 = team mode chosen (count TBD), 2-4 = finalized count."""
+        """team_mode: 0 = solo, -1 = team mode chosen (count TBD), 2-MAX_TEAMS = finalized count."""
         with self.connect() as conn:
             conn.execute(
                 "UPDATE tournaments SET team_mode = ? WHERE tournament_id = ?",
@@ -762,6 +762,20 @@ class Storage:
         for tournament_id in tournament_ids:
             all_totals.extend(self.get_tournament_totals(tournament_id))
         return merge_totals(all_totals), len(tournament_ids), match_count
+
+    def add_tournament_team(self, tournament_id: int) -> int:
+        """Bumps team_mode by 1 (capped at MAX_TEAMS) for an already-active team-mode
+        tournament, so a newly added team is recognized by team-count-driven views
+        (scoreboard grouping, etc). Returns the new team number."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT team_mode FROM tournaments WHERE tournament_id = ?", (tournament_id,)
+            ).fetchone()
+            new_count = min(MAX_TEAMS, (row["team_mode"] or 0) + 1)
+            conn.execute(
+                "UPDATE tournaments SET team_mode = ? WHERE tournament_id = ?", (new_count, tournament_id)
+            )
+            return new_count
 
     def list_known_chat_ids(self) -> list[int]:
         with self.connect() as conn:

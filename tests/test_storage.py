@@ -214,9 +214,9 @@ class StorageTests(unittest.TestCase):
         tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1, default_name="Cup")
         self.storage.set_draft_mode(tid, -1)
         self.storage.set_draft_team_step(tid, 1)
-        for _ in range(10):
+        for _ in range(20):
             self.storage.advance_draft_team_step(tid)
-        self.assertEqual(self.storage.get_tournament(tid)["team_step"], 4)
+        self.assertEqual(self.storage.get_tournament(tid)["team_step"], 8)
 
     def test_four_team_tournament_totals(self) -> None:
         self.storage.register_chat_presence(
@@ -254,6 +254,59 @@ class StorageTests(unittest.TestCase):
         tid = self._setup_solo_tournament()
         self.storage.start_tournament(tid)
         self.assertFalse(self.storage.undo_last_saved_match(tid))
+
+    def test_add_tournament_team_increments_and_caps_at_max_teams(self) -> None:
+        tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1, default_name="Cup")
+        self.storage.set_draft_mode(tid, 2)
+        for expected in range(3, 9):
+            self.assertEqual(self.storage.add_tournament_team(tid), expected)
+        # already at MAX_TEAMS (8) -> stays capped
+        self.assertEqual(self.storage.add_tournament_team(tid), 8)
+
+    def test_mid_tournament_team_change_carries_into_the_next_match(self) -> None:
+        """Roster edits mid-tournament go through match_players (the live match's own
+        roster), which save_match_and_advance then syncs back into tournament_players —
+        so the change sticks for every following match too."""
+        tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1, default_name="Cup")
+        self.storage.set_draft_mode(tid, -1)
+        self.storage.set_draft_team_step(tid, 1)
+        self.storage.toggle_draft_player(tid, 1, 1)
+        self.storage.toggle_draft_player(tid, 2, 2)
+        self.storage.set_draft_mode(tid, 2)
+        match1 = self.storage.start_tournament(tid)
+        self.assertEqual({p["user_id"]: p["team"] for p in self.storage.get_match_players(match1)}, {1: 1, 2: 2})
+
+        # add player 3 to the live match; one tap = team 1
+        self.storage.toggle_match_roster(match1, 3, 2)
+        self.assertEqual(
+            {p["user_id"]: p["team"] for p in self.storage.get_match_players(match1)}, {1: 1, 2: 2, 3: 1}
+        )
+
+        self.storage.save_match_and_advance(tournament_id=tid, match_id=match1)
+        match2 = self.storage.get_live_match(tid)
+        self.assertEqual(
+            {p["user_id"]: p["team"] for p in self.storage.get_match_players(match2["match_id"])},
+            {1: 1, 2: 2, 3: 1},
+        )
+
+    def test_new_team_becomes_reachable_when_cycling_a_player_through_teams(self) -> None:
+        """add_tournament_team raises the team count, which is what caps the cycle in
+        toggle_match_roster — without it a 2-team tournament could never reach team 3."""
+        tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1, default_name="Cup")
+        self.storage.set_draft_mode(tid, -1)
+        self.storage.set_draft_team_step(tid, 1)
+        self.storage.toggle_draft_player(tid, 1, 1)
+        self.storage.toggle_draft_player(tid, 2, 2)
+        self.storage.set_draft_mode(tid, 2)
+        match_id = self.storage.start_tournament(tid)
+
+        new_count = self.storage.add_tournament_team(tid)
+        self.assertEqual(new_count, 3)
+        # player 1 is on team 1; two taps at team_count=3 moves them to team 3
+        self.storage.toggle_match_roster(match_id, 1, new_count)
+        self.storage.toggle_match_roster(match_id, 1, new_count)
+        teams = {p["user_id"]: p["team"] for p in self.storage.get_match_players(match_id)}
+        self.assertEqual(teams[1], 3)
 
     def test_finish_tournament_discards_live_match(self) -> None:
         tid = self._setup_solo_tournament()
