@@ -62,8 +62,17 @@ def analyze_players(
     settings: Settings,
     players: list[PlayerTotals],
     kill_pairs: dict[tuple[int, int], int],
+    kill_timing: dict[int, float] | None = None,
+    team_by_user: dict[int, int] | None = None,
 ) -> dict[int, dict]:
-    """Returns {user_id: {cool_headed, brutality, game_iq, verdict}}."""
+    """Returns {user_id: {cool_headed, brutality, game_iq, verdict}}.
+
+    kill_timing: per-killer average number of players still alive at the moment of
+    each of their kills (low = strikes late/last, high = engages early) — a real,
+    computed signal for playstyle, distinct from raw kill counts.
+    team_by_user: last known team assignment per user_id (0/absent = solo), so GPT
+    can compare teammates and call out who actually carried a team win.
+    """
     if not settings.openai_api_key:
         raise SummaryError(
             "OPENAI_API_KEY is not configured",
@@ -72,11 +81,18 @@ def analyze_players(
     if not players:
         raise SummaryError("No players to analyze")
 
+    kill_timing = kill_timing or {}
+    team_by_user = team_by_user or {}
     stats_lines = []
     for p in players:
+        timing = kill_timing.get(p.user_id)
+        timing_part = f" ср_живых_на_килл={timing:.1f}" if timing is not None else ""
+        team = team_by_user.get(p.user_id, 0)
+        team_part = f" команда={team}" if team else ""
         stats_lines.append(
-            f"user_id={p.user_id} имя={p.first_name} матчей={p.played} побед={p.tops} "
-            f"убийств={p.kills} смертей={p.deaths} KD={p.kd:.2f}"
+            f"user_id={p.user_id} имя={p.first_name}{team_part} "
+            f"матчей={p.played} побед={p.tops} убийств={p.kills} смертей={p.deaths} "
+            f"KD={p.kd:.2f}{timing_part}"
         )
     duels = [
         f"{killer}→{victim}: {count}" for (killer, victim), count in sorted(
@@ -88,7 +104,15 @@ def analyze_players(
         "Ты спортивный аналитик киберспорта. По сухой статистике турнира PUBG/CS оцени каждого "
         "игрока по трём шкалам от 0 до 100: хладнокровие (cool_headed, стабильность и спокойствие), "
         "жестокость (brutality, агрессия и давление на соперников), игровой интеллект (game_iq, "
-        "принятие решений и стратегия). Оценивай игроков относительно друг друга внутри этого турнира. "
+        "принятие решений и стратегия). Оценивай игроков относительно друг друга внутри этого турнира.\n\n"
+        "Используй ср_живых_на_килл, если она есть: низкое значение значит игрок обычно добивает "
+        "последних (расчётливо ждёт, пока другие перебьют друг друга), высокое — лезет в замес рано "
+        "и часто дерётся, пока в лобби ещё много народу. Это отдельный сигнал стиля игры, не путай "
+        "его с количеством побед.\n\n"
+        "Если это командный турнир: сравнивай игроков внутри их же команды по убийствам. Если у "
+        "игрока есть победы, но почти нет личных убийств, а у его тиммейта убийств явно больше — "
+        "прямо напиши в выводе, что победу принёс тиммейт, а не сам игрок; не хвали за победу того, "
+        "кто её не сделал руками.\n\n"
         "Для каждого напиши короткий вывод на русском (verdict, одна-две фразы, разговорный тон, "
         "как тренерский разбор). Обязательно верни ровно один объект на каждый переданный user_id."
     )

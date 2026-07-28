@@ -659,6 +659,41 @@ class Storage:
             ).fetchall()
         return {(r["killer_id"], r["victim_id"]): r["c"] for r in rows}
 
+    def get_kill_timing_averages(self, tournament_id: int) -> dict[int, float]:
+        """For each killer, the average number of players still alive (including
+        themselves and the victim) at the moment of each of their kills, averaged
+        across every saved match in the tournament. Low = tends to strike late,
+        after others have thinned the lobby out. High = engages early, while most
+        players are still around. This is separate from raw kill counts — two
+        players can have identical kills/KD and still play a completely different
+        way, which this is meant to surface for the GPT breakdown."""
+        with self.connect() as conn:
+            match_ids = [
+                r["match_id"]
+                for r in conn.execute(
+                    "SELECT match_id FROM matches WHERE tournament_id = ? AND status = 'saved'",
+                    (tournament_id,),
+                ).fetchall()
+            ]
+            sums: dict[int, int] = {}
+            counts: dict[int, int] = {}
+            for match_id in match_ids:
+                total = conn.execute(
+                    "SELECT COUNT(*) AS c FROM match_players WHERE match_id = ?", (match_id,)
+                ).fetchone()["c"]
+                kills = conn.execute(
+                    "SELECT killer_id, victim_id FROM kills WHERE match_id = ? ORDER BY kill_id",
+                    (match_id,),
+                ).fetchall()
+                alive = total
+                for k in kills:
+                    if k["killer_id"] != 0:
+                        sums[k["killer_id"]] = sums.get(k["killer_id"], 0) + alive
+                        counts[k["killer_id"]] = counts.get(k["killer_id"], 0) + 1
+                    if k["victim_id"] is not None:
+                        alive -= 1
+        return {uid: sums[uid] / counts[uid] for uid in sums}
+
     def get_match_results_sequence(self, tournament_id: int) -> list[dict[int, bool]]:
         with self.connect() as conn:
             matches = conn.execute(

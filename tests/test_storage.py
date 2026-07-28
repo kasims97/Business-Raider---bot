@@ -141,6 +141,27 @@ class StorageTests(unittest.TestCase):
         rows = {r["user_id"]: r for r in self.storage.get_match_players(match_id)}
         self.assertEqual(rows[2]["top"], 0)
 
+    def test_kill_timing_averages_reflect_when_kills_happen(self) -> None:
+        tid = self._setup_solo_tournament(player_ids=(1, 2, 3))
+        match_id = self.storage.start_tournament(tid)
+        # 3 players alive at the start. Player 1 strikes immediately (3 still alive).
+        self.storage.record_kill(match_id=match_id, killer_id=1, victim_id=2)
+        # now only 2 remain (players 1 and 3) — player 3 waits until this exact moment.
+        self.storage.record_kill(match_id=match_id, killer_id=3, victim_id=1)
+        self.storage.save_match_and_advance(tournament_id=tid, match_id=match_id)
+        averages = self.storage.get_kill_timing_averages(tid)
+        self.assertEqual(averages[1], 3.0)
+        self.assertNotIn(2, averages)  # player 2 never got a kill
+        self.assertEqual(averages[3], 2.0)
+
+    def test_kill_timing_averages_ignore_zone_deaths_as_a_killer(self) -> None:
+        tid = self._setup_solo_tournament()
+        match_id = self.storage.start_tournament(tid)
+        self.storage.record_kill(match_id=match_id, killer_id=0, victim_id=2)
+        self.storage.save_match_and_advance(tournament_id=tid, match_id=match_id)
+        averages = self.storage.get_kill_timing_averages(tid)
+        self.assertNotIn(0, averages)
+
     def test_random_kill_has_no_victim_and_is_excluded_from_matrix(self) -> None:
         tid = self._setup_solo_tournament()
         match_id = self.storage.start_tournament(tid)

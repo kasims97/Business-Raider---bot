@@ -1165,28 +1165,41 @@ class BotHandlers:
         await self._run_analyze_for_tournament(tournament, totals, status_message)
 
     async def _run_analyze_for_tournament(self, tournament, totals, status_message) -> None:
-        kill_pairs = self.storage.get_kill_matrix(tournament["tournament_id"])
+        tournament_id = tournament["tournament_id"]
+        kill_pairs = self.storage.get_kill_matrix(tournament_id)
+        kill_timing = self.storage.get_kill_timing_averages(tournament_id)
+        team_by_user = {p["user_id"]: p["team"] for p in self.storage.get_draft_players(tournament_id)}
         try:
             analysis = await asyncio.to_thread(
-                analyze_players, settings=self.settings, players=totals, kill_pairs=kill_pairs
+                analyze_players,
+                settings=self.settings,
+                players=totals,
+                kill_pairs=kill_pairs,
+                kill_timing=kill_timing,
+                team_by_user=team_by_user,
             )
         except SummaryError as exc:
             logger.error("analyze_players failed: %s", exc)
             await status_message.edit_text(exc.public_message, reply_markup=self._back_to_menu_kb())
             return
-        text = self._format_analysis(tournament, totals, analysis)
+        text = self._format_analysis(tournament, totals, analysis, kill_timing)
         await status_message.edit_text(text, parse_mode="HTML", reply_markup=self._back_to_menu_kb())
 
-    def _format_analysis(self, tournament, totals, analysis: dict[int, dict]) -> str:
+    def _format_analysis(
+        self, tournament, totals, analysis: dict[int, dict], kill_timing: dict[int, float]
+    ) -> str:
         ranked = sort_players(totals)
         name_width = max([len(p.first_name) for p in ranked] + [5])
-        table_lines = [f"{'Игрок':<{name_width}} {'Хладн.':>7} {'Жёстк.':>7} {'Интел.':>7}"]
+        table_lines = [f"{'Игрок':<{name_width}} {'Хладн.':>7} {'Жёстк.':>7} {'Интел.':>7} {'Живых':>7}"]
         for p in ranked:
             a = analysis.get(p.user_id)
             if not a:
                 continue
+            timing = kill_timing.get(p.user_id)
+            timing_cell = f"{timing:.1f}" if timing is not None else "—"
             table_lines.append(
-                f"{p.first_name:<{name_width}} {a['cool_headed']:>7} {a['brutality']:>7} {a['game_iq']:>7}"
+                f"{p.first_name:<{name_width}} {a['cool_headed']:>7} {a['brutality']:>7} "
+                f"{a['game_iq']:>7} {timing_cell:>7}"
             )
         lines = [f"📊 Разбор турнира «{tournament['name']}»", "", "<pre>" + "\n".join(table_lines) + "</pre>", ""]
         lines.append("Выводы:")
@@ -1196,6 +1209,10 @@ class BotHandlers:
                 lines.append(f"• {p.first_name} — {a['verdict']}")
         lines.append("")
         lines.append("90-100 Отлично · 75-89 Хорошо · 60-74 Средне · 40-59 Ниже среднего · 0-39 Плохо")
+        lines.append(
+            "Живых — среднее число живых соперников в момент килла: меньше = добивает последних, "
+            "больше = лезет в замес рано"
+        )
         return "\n".join(lines)
 
     # -- tournaments list --------------------------------------------------
