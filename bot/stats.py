@@ -51,6 +51,10 @@ class PlayerTotals:
     def league_points(self) -> int:
         return self.tops * LEAGUE_POINTS_PER_TOP + self.kills * LEAGUE_POINTS_PER_KILL
 
+    @property
+    def kills_per_match(self) -> float:
+        return self.kills / self.played if self.played else 0.0
+
 
 def sort_players(players: Iterable[PlayerTotals]) -> list[PlayerTotals]:
     return sorted(
@@ -93,19 +97,20 @@ def format_table(*, tournament_name: str, game_label: str, players: list[PlayerT
     summary_lines = [f"{l.ljust(width)}{r}" for l, r in zip(left, right)]
 
     name_width = max([len(p.first_name) for p in ranked] + [5])
-    header = f"{'#':<2} {'Игрок':<{name_width}} {'М':>3} {'K':>4} {'D':>4} {'KD':>5} {'Топы':>10}"
+    header = f"{'#':<2} {'Игрок':<{name_width}} {'М':>3} {'K':>4} {'D':>4} {'KD':>5} {'К/М':>5} {'Топы':>10}"
     table_lines = [header]
     for idx, p in enumerate(ranked, start=1):
         pct = f" ({p.tops * 100 // total_tops}%)" if total_tops else ""
         top_cell = f"{p.tops}{pct}"
         table_lines.append(
             f"{idx:<2} {p.first_name:<{name_width}} {p.played:>3} {p.kills:>4} "
-            f"{p.deaths:>4} {format_kd(p.kd):>5} {top_cell:>10}"
+            f"{p.deaths:>4} {format_kd(p.kd):>5} {p.kills_per_match:>5.1f} {top_cell:>10}"
         )
     total_kd = total_kills / total_deaths if total_deaths else float(total_kills)
+    total_kills_per_match = total_kills / total_matches if total_matches else 0.0
     table_lines.append(
         f"{'Σ':<2} {'ВСЕГО':<{name_width}} {total_matches:>3} {total_kills:>4} "
-        f"{total_deaths:>4} {format_kd(total_kd):>5} {total_tops:>10}"
+        f"{total_deaths:>4} {format_kd(total_kd):>5} {total_kills_per_match:>5.1f} {total_tops:>10}"
     )
 
     body = "\n\n".join(["\n".join(summary_lines), "\n".join(table_lines)])

@@ -172,5 +172,29 @@ class MvpSelfVoteTests(unittest.IsolatedAsyncioTestCase):
         self.storage.cast_mvp_vote.assert_called_once_with(tournament_id=5, voter_id=1, pick_user_id=2)
 
 
+class HistoryViewSoloWinnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.storage = MagicMock()
+        self.handlers = BotHandlers(storage=self.storage, settings=make_settings())
+
+    def test_history_shows_the_survivor_as_winner_not_the_eliminated(self) -> None:
+        # top == 0 means alive/won, top == 1 means eliminated (post elimination-model redesign).
+        self.storage.get_active_tournament.return_value = None
+        self.storage.list_finished_tournaments.return_value = [
+            {"tournament_id": 1, "name": "Test", "team_mode": 0}
+        ]
+        self.storage.list_recent_matches.return_value = [
+            {"match_id": 10, "match_no": 1, "winner_team": None}
+        ]
+        self.storage.get_match_kills.return_value = []
+        self.storage.get_match_players.return_value = [
+            {"first_name": "Ильхам", "top": 0},  # survivor / winner
+            {"first_name": "Хан", "top": 1},  # eliminated
+        ]
+        text, _ = self.handlers._render_history_view(chat_id=100)
+        self.assertIn("🏆 Ильхам", text)
+        self.assertNotIn("🏆 Хан", text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -462,7 +462,7 @@ class BotHandlers:
                     winner = f"{_team_icon(m['winner_team'])} {_team_name(m['winner_team'])}" if m["winner_team"] else "—"
                 else:
                     players = self.storage.get_match_players(m["match_id"])
-                    winners = [p["first_name"] for p in players if p["top"]]
+                    winners = [p["first_name"] for p in players if p["top"] == 0]
                     winner = ", ".join(winners) if winners else "—"
                 line = f"#{m['match_no']} · 🏆 {winner}"
                 if kill_text:

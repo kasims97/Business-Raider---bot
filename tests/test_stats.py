@@ -77,6 +77,20 @@ class StatsTests(unittest.TestCase):
         self.assertIn("35%", text)  # Ильхам: 7/20 tops
         self.assertIn("2.00", text)  # Ильхам KD
 
+    def test_kills_per_match_average(self) -> None:
+        p = make_player(1, "Ильхам", played=20, kills=26, tops=7)
+        self.assertAlmostEqual(p.kills_per_match, 1.3, places=2)
+
+    def test_kills_per_match_zero_when_no_matches(self) -> None:
+        p = make_player(1, "X", played=0, kills=0, tops=0)
+        self.assertEqual(p.kills_per_match, 0.0)
+
+    def test_format_table_shows_kills_per_match_column(self) -> None:
+        players = [make_player(1, "Ильхам", 20, 26, 7)]
+        text = format_table(tournament_name="Test", game_label="PUBG", players=players)
+        self.assertIn("К/М", text)
+        self.assertIn("1.3", text)  # 26 kills / 20 matches
+
     def test_format_table_handles_empty(self) -> None:
         text = format_table(tournament_name="Test", game_label="PUBG", players=[])
         self.assertIn("Пока ни одного", text)
