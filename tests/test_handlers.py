@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
@@ -64,9 +64,11 @@ class RegisterIncidentalUsersTests(unittest.TestCase):
 
 
 class PendingTextGatingTests(unittest.IsolatedAsyncioTestCase):
-    """Regression test: tapping '+ Add player' must not swallow the next
-    unrelated chat message as a player name — only an actual reply to the
-    bot's own prompt counts."""
+    """Regression test: tapping '+ Add player' must not swallow chat messages
+    that are unrelated and stale — but a plain (non-reply) message sent right
+    away is accepted as a fallback in case ForceReply didn't engage on the
+    user's client, since a normal reply is the common case (mention makes
+    `selective=True` target them) and this fallback only covers the rest."""
 
     def setUp(self) -> None:
         self.storage = MagicMock()
@@ -76,34 +78,70 @@ class PendingTextGatingTests(unittest.IsolatedAsyncioTestCase):
 
     def _make_update(self, text: str, reply_to_message_id: int | None):
         reply_to = SimpleNamespace(message_id=reply_to_message_id) if reply_to_message_id else None
+        bot_stub = SimpleNamespace(delete_message=AsyncMock())
         message = SimpleNamespace(
             text=text,
             date=datetime.now(ZoneInfo("Europe/Moscow")),
             reply_to_message=reply_to,
             reply_text=AsyncMock(),
+            get_bot=MagicMock(return_value=bot_stub),
         )
         return SimpleNamespace(effective_message=message, effective_user=self.user, effective_chat=self.chat)
 
-    async def test_unrelated_message_is_ignored_not_added_as_player(self) -> None:
-        self.storage.get_pending_input.return_value = {"kind": "add_player:menu", "prompt_message_id": 42}
+    @staticmethod
+    def _pending(prompt_message_id: int, *, age_seconds: float) -> dict:
+        created_at = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+        return {
+            "kind": "add_player:menu",
+            "prompt_message_id": prompt_message_id,
+            "created_at": created_at.isoformat(),
+        }
+
+    async def test_stale_unrelated_message_is_ignored(self) -> None:
+        self.storage.get_pending_input.return_value = self._pending(42, age_seconds=200)
         update = self._make_update("протестим короч", reply_to_message_id=None)
         await self.handlers._handle_pending_text(update)
         self.storage.add_guest_player.assert_not_called()
         self.storage.clear_pending_input.assert_not_called()
 
-    async def test_reply_to_wrong_message_is_ignored(self) -> None:
-        self.storage.get_pending_input.return_value = {"kind": "add_player:menu", "prompt_message_id": 42}
+    async def test_fresh_non_reply_message_is_accepted_as_fallback(self) -> None:
+        # ForceReply should make this a reply automatically; this covers clients where it doesn't.
+        self.storage.get_pending_input.return_value = self._pending(42, age_seconds=5)
+        self.storage.list_players.return_value = []
+        update = self._make_update("Вова", reply_to_message_id=None)
+        await self.handlers._handle_pending_text(update)
+        self.storage.add_guest_player.assert_called_once()
+
+    async def test_stale_reply_to_wrong_message_is_ignored(self) -> None:
+        self.storage.get_pending_input.return_value = self._pending(42, age_seconds=200)
         update = self._make_update("Вова", reply_to_message_id=999)
         await self.handlers._handle_pending_text(update)
         self.storage.add_guest_player.assert_not_called()
 
     async def test_reply_to_correct_prompt_adds_player(self) -> None:
-        self.storage.get_pending_input.return_value = {"kind": "add_player:menu", "prompt_message_id": 42}
+        self.storage.get_pending_input.return_value = self._pending(42, age_seconds=5)
         self.storage.list_players.return_value = []
         update = self._make_update("Вова", reply_to_message_id=42)
         await self.handlers._handle_pending_text(update)
         self.storage.add_guest_player.assert_called_once()
         self.storage.clear_pending_input.assert_called_once_with(chat_id=100, user_id=1)
+
+    async def test_comma_separates_multiple_names_space_does_not(self) -> None:
+        self.storage.get_pending_input.return_value = self._pending(42, age_seconds=5)
+        self.storage.list_players.return_value = []
+        update = self._make_update("Хан Аднаев", reply_to_message_id=42)
+        await self.handlers._handle_pending_text(update)
+        self.storage.add_guest_player.assert_called_once_with(
+            chat_id=100, first_name="Хан Аднаев", seen_at=update.effective_message.date.date()
+        )
+
+    async def test_comma_separated_names_added_individually(self) -> None:
+        self.storage.get_pending_input.return_value = self._pending(42, age_seconds=5)
+        self.storage.list_players.return_value = []
+        update = self._make_update("Хан, Вова", reply_to_message_id=42)
+        await self.handlers._handle_pending_text(update)
+        names = [call.kwargs["first_name"] for call in self.storage.add_guest_player.call_args_list]
+        self.assertEqual(names, ["Хан", "Вова"])
 
 
 class MvpSelfVoteTests(unittest.IsolatedAsyncioTestCase):

@@ -11,6 +11,7 @@ from typing import Iterator
 from bot.stats import PlayerTotals, merge_totals
 
 PENDING_INPUT_TTL = timedelta(minutes=10)
+MAX_TEAMS = 4
 
 
 class Storage:
@@ -235,7 +236,9 @@ class Storage:
                 "SELECT * FROM tournaments WHERE tournament_id = ?", (tournament_id,)
             ).fetchone()
 
-    def create_setup_draft(self, *, chat_id: int, created_by: int) -> int:
+    def create_setup_draft(self, *, chat_id: int, created_by: int, default_name: str) -> int:
+        """Creates a draft with sensible defaults already applied (PUBG, solo, deduped
+        date-based name) so the setup screen needs zero taps to be startable."""
         with self.connect() as conn:
             existing = conn.execute(
                 "SELECT tournament_id FROM tournaments WHERE chat_id = ? AND status = 'setup'",
@@ -243,14 +246,28 @@ class Storage:
             ).fetchone()
             if existing:
                 return existing["tournament_id"]
+            name = self._unique_tournament_name(conn, chat_id, default_name)
             cur = conn.execute(
                 """
-                INSERT INTO tournaments (chat_id, name, status, created_by, created_at)
-                VALUES (?, '', 'setup', ?, ?)
+                INSERT INTO tournaments (chat_id, name, game, team_mode, status, created_by, created_at)
+                VALUES (?, ?, 'pubg', 0, 'setup', ?, ?)
                 """,
-                (chat_id, created_by, datetime.now(timezone.utc).isoformat()),
+                (chat_id, name, created_by, datetime.now(timezone.utc).isoformat()),
             )
             return cur.lastrowid
+
+    def _unique_tournament_name(self, conn: sqlite3.Connection, chat_id: int, base: str) -> str:
+        existing_names = {
+            row["name"] for row in conn.execute(
+                "SELECT name FROM tournaments WHERE chat_id = ?", (chat_id,)
+            ).fetchall()
+        }
+        if base not in existing_names:
+            return base
+        n = 2
+        while f"{base} ({n})" in existing_names:
+            n += 1
+        return f"{base} ({n})"
 
     def set_draft_name(self, tournament_id: int, name: str) -> None:
         with self.connect() as conn:
@@ -272,14 +289,19 @@ class Storage:
                 (team_count, tournament_id),
             )
 
-    def toggle_draft_player(self, tournament_id: int, user_id: int, team_count: int) -> None:
+    def toggle_draft_player(self, tournament_id: int, user_id: int, is_team: bool) -> None:
+        """Solo: simple in/out toggle. Team mode: cycles through colors that auto-expand
+        as needed — a new color only unlocks once the previous one is already in use, so
+        a lone tap never jumps straight to team 4."""
         with self.connect() as conn:
-            row = conn.execute(
-                "SELECT team FROM tournament_players WHERE tournament_id = ? AND user_id = ?",
-                (tournament_id, user_id),
-            ).fetchone()
-            if team_count == 0:
-                if row is None:
+            rows = conn.execute(
+                "SELECT user_id, team FROM tournament_players WHERE tournament_id = ?",
+                (tournament_id,),
+            ).fetchall()
+            current_row = next((r for r in rows if r["user_id"] == user_id), None)
+
+            if not is_team:
+                if current_row is None:
                     conn.execute(
                         "INSERT INTO tournament_players (tournament_id, user_id, team) VALUES (?, ?, 0)",
                         (tournament_id, user_id),
@@ -291,14 +313,16 @@ class Storage:
                     )
                 return
 
-            current = row["team"] if row is not None else 0
+            current = current_row["team"] if current_row is not None else 0
+            max_others = max((r["team"] for r in rows if r["user_id"] != user_id), default=0)
+            ceiling = min(MAX_TEAMS, max_others + 1)
             next_team = current + 1
-            if next_team > team_count:
+            if next_team > ceiling:
                 conn.execute(
                     "DELETE FROM tournament_players WHERE tournament_id = ? AND user_id = ?",
                     (tournament_id, user_id),
                 )
-            elif row is None:
+            elif current_row is None:
                 conn.execute(
                     "INSERT INTO tournament_players (tournament_id, user_id, team) VALUES (?, ?, ?)",
                     (tournament_id, user_id, next_team),

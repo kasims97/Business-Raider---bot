@@ -23,13 +23,14 @@ class StorageTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def _setup_solo_tournament(self, player_ids=(1, 2, 3)):
-        tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1)
-        self.storage.set_draft_name(tid, "Test Cup")
-        self.storage.set_draft_game(tid, "pubg")
-        self.storage.set_draft_mode(tid, 0)
+        tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1, default_name="Test Cup")
         for uid in player_ids:
-            self.storage.toggle_draft_player(tid, uid, 0)
+            self.storage.toggle_draft_player(tid, uid, False)
         return tid
+
+    def _team_of(self, tournament_id: int, user_id: int) -> int | None:
+        row = next((r for r in self.storage.get_draft_players(tournament_id) if r["user_id"] == user_id), None)
+        return row["team"] if row is not None else None
 
     def test_guest_players_get_negative_ids_and_dont_collide(self) -> None:
         first = self.storage.add_guest_player(chat_id=CHAT, first_name="Вова", seen_at=date(2026, 1, 1))
@@ -45,9 +46,31 @@ class StorageTests(unittest.TestCase):
         self.assertEqual({p.user_id for p in players}, {1, 3})
 
     def test_only_one_setup_draft_per_chat(self) -> None:
-        tid1 = self.storage.create_setup_draft(chat_id=CHAT, created_by=1)
-        tid2 = self.storage.create_setup_draft(chat_id=CHAT, created_by=2)
+        tid1 = self.storage.create_setup_draft(chat_id=CHAT, created_by=1, default_name="28.07")
+        tid2 = self.storage.create_setup_draft(chat_id=CHAT, created_by=2, default_name="28.07")
         self.assertEqual(tid1, tid2)
+
+    def test_create_setup_draft_defaults_are_immediately_startable(self) -> None:
+        tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1, default_name="28.07")
+        draft = self.storage.get_tournament(tid)
+        self.assertEqual(draft["name"], "28.07")
+        self.assertEqual(draft["game"], "pubg")
+        self.assertEqual(draft["team_mode"], 0)
+
+    def test_create_setup_draft_dedupes_name_within_chat(self) -> None:
+        tid1 = self.storage.create_setup_draft(chat_id=CHAT, created_by=1, default_name="28.07")
+        self.storage.set_draft_name(tid1, "28.07")  # simulate a finished/renamed earlier draft with this name
+        self.storage.cancel_draft(tid1)
+        # fake a finished tournament with the same name to trigger dedup on the next draft
+        with self.storage.connect() as conn:
+            conn.execute(
+                "INSERT INTO tournaments (chat_id, name, game, team_mode, status, created_by, created_at) "
+                "VALUES (?, '28.07', 'pubg', 0, 'finished', 1, '2026-01-01T00:00:00+00:00')",
+                (CHAT,),
+            )
+        tid2 = self.storage.create_setup_draft(chat_id=CHAT, created_by=1, default_name="28.07")
+        draft = self.storage.get_tournament(tid2)
+        self.assertEqual(draft["name"], "28.07 (2)")
 
     def test_live_match_not_counted_in_totals(self) -> None:
         tid = self._setup_solo_tournament()
@@ -111,14 +134,14 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(totals[1].kills, 2)  # both kills still count toward the killer's total
 
     def test_team_mode_win_credited_to_whole_team(self) -> None:
-        tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1)
-        self.storage.set_draft_name(tid, "Team Cup")
+        tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1, default_name="Team Cup")
         self.storage.set_draft_game(tid, "cs")
-        self.storage.set_draft_mode(tid, 2)
-        self.storage.toggle_draft_player(tid, 1, 2)  # -> team 1
-        self.storage.toggle_draft_player(tid, 2, 2)  # -> team 1
-        self.storage.toggle_draft_player(tid, 3, 2)  # -> team 1
-        self.storage.toggle_draft_player(tid, 3, 2)  # -> team 2
+        self.storage.set_draft_mode(tid, -1)  # team mode chosen, count not known yet
+        self.storage.toggle_draft_player(tid, 1, True)  # -> team 1
+        self.storage.toggle_draft_player(tid, 2, True)  # -> team 1
+        self.storage.toggle_draft_player(tid, 3, True)  # -> team 1
+        self.storage.toggle_draft_player(tid, 3, True)  # -> team 2
+        self.storage.set_draft_mode(tid, 2)  # finalized, as handlers._start_tournament does
         match_id = self.storage.start_tournament(tid)
         self.storage.set_winner_team(match_id=match_id, team=1)
         self.storage.save_match_and_advance(tournament_id=tid, match_id=match_id)
@@ -127,29 +150,46 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(totals[2].tops, 1)
         self.assertEqual(totals[3].tops, 0)
 
-    def test_toggle_draft_player_cycles_through_n_teams_then_removes(self) -> None:
-        tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1)
-        self.storage.set_draft_mode(tid, 3)
-        self.storage.toggle_draft_player(tid, 1, 3)  # -> team 1
-        self.assertEqual(self.storage.get_draft_players(tid)[0]["team"], 1)
-        self.storage.toggle_draft_player(tid, 1, 3)  # -> team 2
-        self.assertEqual(self.storage.get_draft_players(tid)[0]["team"], 2)
-        self.storage.toggle_draft_player(tid, 1, 3)  # -> team 3
-        self.assertEqual(self.storage.get_draft_players(tid)[0]["team"], 3)
-        self.storage.toggle_draft_player(tid, 1, 3)  # -> removed
-        self.assertEqual(self.storage.get_draft_players(tid), [])
+    def test_toggle_draft_player_alone_can_only_reach_team_one(self) -> None:
+        tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1, default_name="Cup")
+        self.storage.set_draft_mode(tid, -1)
+        self.storage.toggle_draft_player(tid, 1, True)
+        self.assertEqual(self._team_of(tid, 1), 1)
+        # no one else has a team yet, so the next tap wraps back to "not playing"
+        self.storage.toggle_draft_player(tid, 1, True)
+        self.assertIsNone(self._team_of(tid, 1))
+
+    def test_toggle_draft_player_new_color_unlocks_once_previous_is_used(self) -> None:
+        tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1, default_name="Cup")
+        self.storage.set_draft_mode(tid, -1)
+        self.storage.toggle_draft_player(tid, 1, True)  # team 1
+        self.storage.toggle_draft_player(tid, 2, True)  # team 1
+        self.storage.toggle_draft_player(tid, 2, True)  # team 2 (unlocked: team 1 already in use)
+        self.assertEqual(self._team_of(tid, 2), 2)
+        # team 2 now exists, so player 1 can also reach it, and since someone is now on
+        # team 2 that in turn unlocks team 3 as the next available color for anyone
+        self.storage.toggle_draft_player(tid, 1, True)  # team 2
+        self.assertEqual(self._team_of(tid, 1), 2)
+        self.storage.toggle_draft_player(tid, 1, True)  # team 3
+        self.assertEqual(self._team_of(tid, 1), 3)
+        # but no one else is on team 3, so the next tap wraps back to "not playing"
+        self.storage.toggle_draft_player(tid, 1, True)
+        self.assertIsNone(self._team_of(tid, 1))
 
     def test_four_team_tournament_totals(self) -> None:
         self.storage.register_chat_presence(
             chat_id=CHAT, user_id=4, username=None, first_name="Ярик", is_bot=False, seen_at=date(2026, 1, 1)
         )
-        tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1)
-        self.storage.set_draft_name(tid, "Battle Royale Teams")
+        tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1, default_name="Battle Royale Teams")
         self.storage.set_draft_game(tid, "pubg")
+        self.storage.set_draft_mode(tid, -1)
+        # each successive player taps one more time than the last, which is exactly what
+        # unlocks their color: by the time player N taps N times, player N-1 already sits
+        # on color N-1.
+        for uid, taps in ((1, 1), (2, 2), (3, 3), (4, 4)):
+            for _ in range(taps):
+                self.storage.toggle_draft_player(tid, uid, True)
         self.storage.set_draft_mode(tid, 4)
-        for uid, team_taps in ((1, 1), (2, 2), (3, 3), (4, 4)):
-            for _ in range(team_taps):
-                self.storage.toggle_draft_player(tid, uid, 4)
         match_id = self.storage.start_tournament(tid)
         self.storage.set_winner_team(match_id=match_id, team=3)
         self.storage.save_match_and_advance(tournament_id=tid, match_id=match_id)
@@ -259,12 +299,13 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(self.storage.match_has_progress(match_id))
 
     def test_match_has_progress_true_after_team_win_set(self) -> None:
-        tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1)
-        self.storage.set_draft_name(tid, "Team Cup")
+        tid = self.storage.create_setup_draft(chat_id=CHAT, created_by=1, default_name="Team Cup")
         self.storage.set_draft_game(tid, "cs")
+        self.storage.set_draft_mode(tid, -1)
+        self.storage.toggle_draft_player(tid, 1, True)  # team 1
+        self.storage.toggle_draft_player(tid, 2, True)  # team 1
+        self.storage.toggle_draft_player(tid, 2, True)  # team 2
         self.storage.set_draft_mode(tid, 2)
-        self.storage.toggle_draft_player(tid, 1, 2)
-        self.storage.toggle_draft_player(tid, 2, 2)
         match_id = self.storage.start_tournament(tid)
         self.assertFalse(self.storage.match_has_progress(match_id))
         self.storage.set_winner_team(match_id=match_id, team=1)

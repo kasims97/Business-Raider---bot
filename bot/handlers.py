@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
@@ -29,7 +30,6 @@ logger = logging.getLogger(__name__)
 GAME_LABELS = {"pubg": "PUBG", "cs": "CS"}
 TEAM_ICONS = {1: "🔴", 2: "🔵", 3: "🟢", 4: "🟡"}
 TEAM_NAMES = {1: "Красные", 2: "Синие", 3: "Зелёные", 4: "Жёлтые"}
-MAX_TEAMS = 4
 
 
 def _team_icon(team: int | None) -> str:
@@ -38,6 +38,9 @@ def _team_icon(team: int | None) -> str:
 
 def _team_name(team: int | None) -> str:
     return TEAM_NAMES.get(team, f"Команда {team}")
+
+
+PENDING_FALLBACK_WINDOW = timedelta(seconds=90)
 SETTINGS_LABELS = {
     "quips": "🤖 Подколы от GPT",
     "predictions": "🔮 Прогнозы перед турниром",
@@ -187,22 +190,47 @@ class BotHandlers:
 
     # -- pending free-text input -------------------------------------------
 
+    async def _send_force_reply_prompt(self, message, user, ask_text: str, placeholder: str):
+        """Mentions the user so Telegram's `selective` ForceReply targets them specifically —
+        without a mention or an existing reply-to-them, selective ForceReply activates for
+        no one, which is why plain typing silently did nothing before this fix."""
+        mention = f'<a href="tg://user?id={user.id}">{html.escape(user.first_name)}</a>'
+        return await message.reply_text(
+            f"{mention}, {ask_text}",
+            parse_mode="HTML",
+            do_quote=False,
+            reply_markup=ForceReply(selective=True, input_field_placeholder=placeholder),
+        )
+
+    def _pending_is_fresh(self, pending) -> bool:
+        created_at = datetime.fromisoformat(pending["created_at"])
+        return datetime.now(timezone.utc) - created_at <= PENDING_FALLBACK_WINDOW
+
     async def _handle_pending_text(self, update: Update) -> None:
         message = update.effective_message
         user = update.effective_user
         chat = update.effective_chat
-        if message is None or user is None or chat is None:
+        if message is None or user is None or chat is None or message.text is None:
             return
         pending = self.storage.get_pending_input(chat_id=chat.id, user_id=user.id)
         if pending is None:
             return
-        # Only treat this as an answer if it's a reply to our own prompt —
-        # otherwise any unrelated chat message would get silently hijacked.
+
+        # Answering by replying to our prompt always counts. If that didn't happen
+        # (e.g. ForceReply didn't kick in on some client), a plain message from the
+        # same person still counts, but only within a short window — long enough to
+        # cover a slow typer, short enough that unrelated later chatter isn't swallowed.
         reply_to_id = message.reply_to_message.message_id if message.reply_to_message else None
-        if reply_to_id != pending["prompt_message_id"]:
+        is_direct_reply = reply_to_id == pending["prompt_message_id"]
+        if not is_direct_reply and not self._pending_is_fresh(pending):
             return
+
         self.storage.clear_pending_input(chat_id=chat.id, user_id=user.id)
         kind = pending["kind"]
+        try:
+            await message.get_bot().delete_message(chat_id=chat.id, message_id=pending["prompt_message_id"])
+        except Exception:
+            pass
 
         if kind == "tn_name":
             draft = self.storage.get_setup_draft(chat.id)
@@ -210,35 +238,37 @@ class BotHandlers:
                 return
             name = message.text.strip()[:60] or "Без названия"
             self.storage.set_draft_name(draft["tournament_id"], name)
-            draft = self.storage.get_tournament(draft["tournament_id"])
-            text, kb = self._render_wizard_step(draft, chat.id)
-            await message.reply_text(text, reply_markup=kb, do_quote=False)
+            text, kb = self._render_setup_screen(chat.id, draft["tournament_id"])
+            await message.reply_text(f"✅ Название: {name}\n\n{text}", reply_markup=kb, do_quote=False)
             return
 
         if kind.startswith("add_player:"):
             origin = kind.split(":", 1)[1]
-            names = [n.strip() for n in message.text.split() if n.strip()][:5]
+            raw = message.text.strip()
+            names = [n.strip() for n in raw.split(",") if n.strip()] if "," in raw else ([raw] if raw else [])
+            names = names[:5]
             for name in names:
                 self.storage.add_guest_player(
                     chat_id=chat.id, first_name=name, seen_at=self._localized(message.date).date()
                 )
             if not names:
                 return
+            confirmation = f"✅ Добавлен{'ы' if len(names) > 1 else ''}: {', '.join(names)}"
             if origin == "setup":
                 draft = self.storage.get_setup_draft(chat.id)
                 if draft is not None:
-                    text, kb = self._render_roster_step(chat.id, draft["tournament_id"], draft["team_mode"])
-                    await message.reply_text(text, reply_markup=kb, do_quote=False)
+                    text, kb = self._render_setup_screen(chat.id, draft["tournament_id"])
+                    await message.reply_text(f"{confirmation}\n\n{text}", reply_markup=kb, do_quote=False)
             elif origin == "roster":
                 tournament = self.storage.get_active_tournament(chat.id)
                 if tournament is not None:
                     live = self.storage.get_live_match(tournament["tournament_id"])
                     if live is not None:
                         text, kb = self._render_match_roster(live["match_id"], chat.id)
-                        await message.reply_text(text, reply_markup=kb, do_quote=False)
+                        await message.reply_text(f"{confirmation}\n\n{text}", reply_markup=kb, do_quote=False)
             else:
                 text, kb = self._render_players_screen(chat.id)
-                await message.reply_text(text, reply_markup=kb, do_quote=False)
+                await message.reply_text(f"{confirmation}\n\n{text}", reply_markup=kb, do_quote=False)
 
     # -- command shortcuts ---------------------------------------------------
 
@@ -466,7 +496,7 @@ class BotHandlers:
             )
         return "\n".join(lines), kb
 
-    # -- tournament setup wizard ---------------------------------------------
+    # -- tournament setup (single screen) ------------------------------------
 
     async def _start_or_resume_setup(self, query, chat_id: int) -> None:
         draft = self.storage.get_setup_draft(chat_id)
@@ -475,77 +505,65 @@ class BotHandlers:
             if active is not None:
                 await query.answer("Турнир уже идёт. Сначала заверши текущий.", show_alert=True)
                 return
-            tournament_id = self.storage.create_setup_draft(chat_id=chat_id, created_by=query.from_user.id)
-            draft = self.storage.get_tournament(tournament_id)
+            default_name = datetime.now(self.settings.timezone).strftime("%d.%m")
+            tournament_id = self.storage.create_setup_draft(
+                chat_id=chat_id, created_by=query.from_user.id, default_name=default_name
+            )
+        else:
+            tournament_id = draft["tournament_id"]
         await query.answer()
-        text, kb = self._render_wizard_step(draft, chat_id)
+        text, kb = self._render_setup_screen(chat_id, tournament_id)
         await query.edit_message_text(text, reply_markup=kb)
 
-    def _render_wizard_step(self, draft, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
-        if not draft["name"]:
-            return self._render_name_step()
-        if not draft["game"]:
-            return self._render_game_step()
-        if draft["team_mode"] is None:
-            return self._render_mode_step()
-        return self._render_roster_step(chat_id, draft["tournament_id"], draft["team_mode"])
-
-    def _render_name_step(self) -> tuple[str, InlineKeyboardMarkup]:
-        today = datetime.now(self.settings.timezone).strftime("%d.%m")
-        kb = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton(f"Сегодня, {today}", callback_data="tn:name:today")],
-                [InlineKeyboardButton("✏️ Своё название", callback_data="tn:name:custom")],
-            ]
-        )
-        return "Как назовём турнир?", kb
-
-    def _render_game_step(self) -> tuple[str, InlineKeyboardMarkup]:
-        kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("PUBG", callback_data="tn:game:pubg"), InlineKeyboardButton("CS", callback_data="tn:game:cs")]]
-        )
-        return "Игра?", kb
-
-    def _render_mode_step(self) -> tuple[str, InlineKeyboardMarkup]:
-        kb = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("Соло — каждый сам за себя", callback_data="tn:mode:0")],
-                [InlineKeyboardButton("2 команды", callback_data="tn:mode:2")],
-                [InlineKeyboardButton("3 команды", callback_data="tn:mode:3")],
-                [InlineKeyboardButton("4 команды", callback_data="tn:mode:4")],
-            ]
-        )
-        return "Как играем?", kb
-
-    def _render_roster_step(self, chat_id: int, tournament_id: int, team_count: int) -> tuple[str, InlineKeyboardMarkup]:
+    def _render_setup_screen(self, chat_id: int, tournament_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        draft = self.storage.get_tournament(tournament_id)
+        is_team = draft["team_mode"] != 0
         all_players = self.storage.list_players(chat_id)
         selected = {r["user_id"]: r["team"] for r in self.storage.get_draft_players(tournament_id)}
-        rows: list[list[InlineKeyboardButton]] = []
+
+        rows: list[list[InlineKeyboardButton]] = [
+            [
+                InlineKeyboardButton(
+                    ("✅ " if draft["game"] == "pubg" else "") + "PUBG", callback_data="tn:game:pubg"
+                ),
+                InlineKeyboardButton(("✅ " if draft["game"] == "cs" else "") + "CS", callback_data="tn:game:cs"),
+            ],
+            [
+                InlineKeyboardButton(("✅ " if not is_team else "") + "Соло", callback_data="tn:mode:solo"),
+                InlineKeyboardButton(("✅ " if is_team else "") + "Командами", callback_data="tn:mode:team"),
+            ],
+        ]
+
         line: list[InlineKeyboardButton] = []
         for p in all_players:
             team = selected.get(p.user_id)
-            if team_count == 0:
-                label = f"{'✅' if team is not None else '⬜'} {p.first_name}"
-            else:
-                label = f"{_team_icon(team)} {p.first_name}"
+            label = f"{_team_icon(team) if is_team else ('✅' if team is not None else '⬜')} {p.first_name}"
             line.append(InlineKeyboardButton(label, callback_data=f"tn:p:{p.user_id}"))
             if len(line) == 2:
                 rows.append(line)
                 line = []
         if line:
             rows.append(line)
-        rows.append([InlineKeyboardButton("➕ Добавить игрока", callback_data="ap:setup")])
+
         rows.append(
             [
-                InlineKeyboardButton("🚀 Начать турнир", callback_data="tn:start"),
+                InlineKeyboardButton("➕ Игрок", callback_data="ap:setup"),
+                InlineKeyboardButton("✏️ Название", callback_data="tn:name:custom"),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton("🚀 Начать", callback_data="tn:start"),
                 InlineKeyboardButton("🗑 Отмена", callback_data="tn:cancel"),
             ]
         )
-        if team_count > 0:
-            cycle = " → ".join([_team_name(t) + " " + _team_icon(t) for t in range(1, team_count + 1)])
-            text = f"Кто играет? Тапай по имени, чтобы распределить по командам:\n⬜ не играет → {cycle} → ⬜"
-        else:
-            text = "Кто играет? Тапай по имени, чтобы включить/выключить."
+
+        note = (
+            "Тапай по имени: цвет команды назначается по очереди, новый цвет открывается по мере надобности."
+            if is_team
+            else "Тапай по имени, чтобы включить/выключить."
+        )
+        text = f"🏆 Новый турнир · {draft['name']}\n\n{note}"
         if not all_players:
             text += "\n\nПока никого не знаю — напиши что-нибудь в чат или добавь игрока вручную."
         return text, InlineKeyboardMarkup(rows)
@@ -559,46 +577,34 @@ class BotHandlers:
         action = parts[1]
 
         if action == "name":
-            if parts[2] == "today":
-                name = f"Сегодня, {datetime.now(self.settings.timezone).strftime('%d.%m')}"
-                self.storage.set_draft_name(tournament_id, name)
-                await query.answer()
-                draft = self.storage.get_tournament(tournament_id)
-                text, kb = self._render_wizard_step(draft, chat_id)
-                await query.edit_message_text(text, reply_markup=kb)
-            else:
-                await query.answer()
-                prompt = await query.message.reply_text(
-                    "Напиши название турнира.",
-                    do_quote=False,
-                    reply_markup=ForceReply(selective=True, input_field_placeholder="Название турнира"),
-                )
-                self.storage.set_pending_input(
-                    chat_id=chat_id, user_id=query.from_user.id, kind="tn_name", prompt_message_id=prompt.message_id
-                )
+            await query.answer()
+            prompt = await self._send_force_reply_prompt(
+                query.message, query.from_user, "напиши название турнира.", "Название турнира"
+            )
+            self.storage.set_pending_input(
+                chat_id=chat_id, user_id=query.from_user.id, kind="tn_name", prompt_message_id=prompt.message_id
+            )
             return
 
         if action == "game":
             self.storage.set_draft_game(tournament_id, parts[2])
             await query.answer()
-            draft = self.storage.get_tournament(tournament_id)
-            text, kb = self._render_wizard_step(draft, chat_id)
+            text, kb = self._render_setup_screen(chat_id, tournament_id)
             await query.edit_message_text(text, reply_markup=kb)
             return
 
         if action == "mode":
-            self.storage.set_draft_mode(tournament_id, int(parts[2]))
+            self.storage.set_draft_mode(tournament_id, 0 if parts[2] == "solo" else -1)
             await query.answer()
-            draft = self.storage.get_tournament(tournament_id)
-            text, kb = self._render_wizard_step(draft, chat_id)
+            text, kb = self._render_setup_screen(chat_id, tournament_id)
             await query.edit_message_text(text, reply_markup=kb)
             return
 
         if action == "p":
             user_id = int(parts[2])
-            self.storage.toggle_draft_player(tournament_id, user_id, draft["team_mode"])
+            self.storage.toggle_draft_player(tournament_id, user_id, draft["team_mode"] != 0)
             await query.answer()
-            text, kb = self._render_roster_step(chat_id, tournament_id, draft["team_mode"])
+            text, kb = self._render_setup_screen(chat_id, tournament_id)
             await query.edit_message_text(text, reply_markup=kb)
             return
 
@@ -615,14 +621,15 @@ class BotHandlers:
 
     async def _start_tournament(self, query, chat_id: int, draft) -> None:
         tournament_id = draft["tournament_id"]
-        team_count = draft["team_mode"]
+        is_team = draft["team_mode"] != 0
         players = self.storage.get_draft_players(tournament_id)
-        if team_count > 0:
-            empty_teams = [t for t in range(1, team_count + 1) if not any(p["team"] == t for p in players)]
-            if empty_teams:
-                names = ", ".join(_team_name(t) for t in empty_teams)
-                await query.answer(f"Нужен хотя бы один игрок в каждой команде. Пусто: {names}.", show_alert=True)
+
+        if is_team:
+            distinct_teams = sorted({p["team"] for p in players if p["team"] > 0})
+            if len(distinct_teams) < 2:
+                await query.answer("Раздели игроков минимум на 2 команды — тапай по имени.", show_alert=True)
                 return
+            self.storage.set_draft_mode(tournament_id, max(distinct_teams))
         elif len(players) < 2:
             await query.answer("Нужно минимум два игрока.", show_alert=True)
             return
@@ -1154,10 +1161,11 @@ class BotHandlers:
     async def _handle_add_player_callback(self, query, chat_id: int, parts: list[str]) -> None:
         origin = parts[1]
         await query.answer()
-        prompt = await query.message.reply_text(
-            "Напиши имя нового игрока. Можно сразу несколько через пробел.",
-            do_quote=False,
-            reply_markup=ForceReply(selective=True, input_field_placeholder="Имя игрока"),
+        prompt = await self._send_force_reply_prompt(
+            query.message,
+            query.from_user,
+            "напиши имя нового игрока. Несколько — через запятую.",
+            "Имя игрока",
         )
         self.storage.set_pending_input(
             chat_id=chat_id,
