@@ -264,20 +264,21 @@ class Storage:
                 "UPDATE tournaments SET game = ? WHERE tournament_id = ?", (game, tournament_id)
             )
 
-    def set_draft_mode(self, tournament_id: int, team_mode: bool) -> None:
+    def set_draft_mode(self, tournament_id: int, team_count: int) -> None:
+        """team_count: 0 = solo, 2-4 = number of teams."""
         with self.connect() as conn:
             conn.execute(
                 "UPDATE tournaments SET team_mode = ? WHERE tournament_id = ?",
-                (int(team_mode), tournament_id),
+                (team_count, tournament_id),
             )
 
-    def toggle_draft_player(self, tournament_id: int, user_id: int, team_mode: bool) -> None:
+    def toggle_draft_player(self, tournament_id: int, user_id: int, team_count: int) -> None:
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT team FROM tournament_players WHERE tournament_id = ? AND user_id = ?",
                 (tournament_id, user_id),
             ).fetchone()
-            if not team_mode:
+            if team_count == 0:
                 if row is None:
                     conn.execute(
                         "INSERT INTO tournament_players (tournament_id, user_id, team) VALUES (?, ?, 0)",
@@ -290,20 +291,22 @@ class Storage:
                     )
                 return
 
-            if row is None:
-                conn.execute(
-                    "INSERT INTO tournament_players (tournament_id, user_id, team) VALUES (?, ?, 1)",
-                    (tournament_id, user_id),
-                )
-            elif row["team"] == 1:
-                conn.execute(
-                    "UPDATE tournament_players SET team = 2 WHERE tournament_id = ? AND user_id = ?",
-                    (tournament_id, user_id),
-                )
-            else:
+            current = row["team"] if row is not None else 0
+            next_team = current + 1
+            if next_team > team_count:
                 conn.execute(
                     "DELETE FROM tournament_players WHERE tournament_id = ? AND user_id = ?",
                     (tournament_id, user_id),
+                )
+            elif row is None:
+                conn.execute(
+                    "INSERT INTO tournament_players (tournament_id, user_id, team) VALUES (?, ?, ?)",
+                    (tournament_id, user_id, next_team),
+                )
+            else:
+                conn.execute(
+                    "UPDATE tournament_players SET team = ? WHERE tournament_id = ? AND user_id = ?",
+                    (next_team, tournament_id, user_id),
                 )
 
     def get_draft_players(self, tournament_id: int) -> list[sqlite3.Row]:
@@ -377,13 +380,13 @@ class Storage:
                 (match_id,),
             ).fetchall()
 
-    def toggle_match_roster(self, match_id: int, user_id: int, team_mode: bool) -> None:
+    def toggle_match_roster(self, match_id: int, user_id: int, team_count: int) -> None:
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT team FROM match_players WHERE match_id = ? AND user_id = ?",
                 (match_id, user_id),
             ).fetchone()
-            if not team_mode:
+            if team_count == 0:
                 if row is None:
                     conn.execute(
                         "INSERT INTO match_players (match_id, user_id, team, top) VALUES (?, ?, 0, 0)",
@@ -396,20 +399,22 @@ class Storage:
                     )
                 return
 
-            if row is None:
-                conn.execute(
-                    "INSERT INTO match_players (match_id, user_id, team, top) VALUES (?, ?, 1, 0)",
-                    (match_id, user_id),
-                )
-            elif row["team"] == 1:
-                conn.execute(
-                    "UPDATE match_players SET team = 2 WHERE match_id = ? AND user_id = ?",
-                    (match_id, user_id),
-                )
-            else:
+            current = row["team"] if row is not None else 0
+            next_team = current + 1
+            if next_team > team_count:
                 conn.execute(
                     "DELETE FROM match_players WHERE match_id = ? AND user_id = ?",
                     (match_id, user_id),
+                )
+            elif row is None:
+                conn.execute(
+                    "INSERT INTO match_players (match_id, user_id, team, top) VALUES (?, ?, ?, 0)",
+                    (match_id, user_id, next_team),
+                )
+            else:
+                conn.execute(
+                    "UPDATE match_players SET team = ? WHERE match_id = ? AND user_id = ?",
+                    (next_team, match_id, user_id),
                 )
 
     def record_kill(self, *, match_id: int, killer_id: int, victim_id: int | None) -> None:
@@ -546,7 +551,7 @@ class Storage:
         tops: Counter[int] = Counter()
         for row in mp_rows:
             played[row["user_id"]] += 1
-            if row["team"] in (1, 2):
+            if row["team"] > 0:
                 won = row["team"] == winner_by_match[row["match_id"]]
             else:
                 won = row["top"] == 1
@@ -617,7 +622,7 @@ class Storage:
                 ).fetchall()
                 entry = {}
                 for row in rows:
-                    if row["team"] in (1, 2):
+                    if row["team"] > 0:
                         entry[row["user_id"]] = row["team"] == m["winner_team"]
                     else:
                         entry[row["user_id"]] = row["top"] == 1

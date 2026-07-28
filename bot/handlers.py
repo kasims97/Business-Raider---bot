@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from types import SimpleNamespace
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
 from telegram.constants import ChatType
 from telegram.ext import ContextTypes
 
@@ -27,6 +27,17 @@ from bot.storage import Storage
 logger = logging.getLogger(__name__)
 
 GAME_LABELS = {"pubg": "PUBG", "cs": "CS"}
+TEAM_ICONS = {1: "🔴", 2: "🔵", 3: "🟢", 4: "🟡"}
+TEAM_NAMES = {1: "Красные", 2: "Синие", 3: "Зелёные", 4: "Жёлтые"}
+MAX_TEAMS = 4
+
+
+def _team_icon(team: int | None) -> str:
+    return TEAM_ICONS.get(team, "⬜")
+
+
+def _team_name(team: int | None) -> str:
+    return TEAM_NAMES.get(team, f"Команда {team}")
 SETTINGS_LABELS = {
     "quips": "🤖 Подколы от GPT",
     "predictions": "🔮 Прогнозы перед турниром",
@@ -216,7 +227,7 @@ class BotHandlers:
             if origin == "setup":
                 draft = self.storage.get_setup_draft(chat.id)
                 if draft is not None:
-                    text, kb = self._render_roster_step(chat.id, draft["tournament_id"], bool(draft["team_mode"]))
+                    text, kb = self._render_roster_step(chat.id, draft["tournament_id"], draft["team_mode"])
                     await message.reply_text(text, reply_markup=kb, do_quote=False)
             elif origin == "roster":
                 tournament = self.storage.get_active_tournament(chat.id)
@@ -281,7 +292,7 @@ class BotHandlers:
             "1. /menu — открыть меню\n"
             "2. 🏆 Новый турнир — выбрать игру, режим и кто играет (один раз в начале вечера)\n"
             "3. Дальше во время игры — только кнопки: ➕ засчитывает убийство и спросит, кого убили; "
-            "🏆 — взял топ (или «Победила А/Б» в команде)\n"
+            "🏆 — взял топ (или победа команды по цвету, если играете 2-4 командами)\n"
             "4. ✅ Матч сыгран — бот публикует таблицу и сразу открывает следующий матч с тем же составом\n"
             "5. 🏁 Завершить турнир — итоговая таблица, кто кого убивал, титулы и разбор от GPT\n\n"
             "Если запутался — просто набери /menu, там всё видно кнопками."
@@ -416,12 +427,7 @@ class BotHandlers:
                     by_killer.setdefault(k["killer_name"], []).append(k["victim_name"] or "случайного")
                 kill_text = "; ".join(f"{name} убил {', '.join(v)}" for name, v in by_killer.items())
                 if tournament["team_mode"]:
-                    if m["winner_team"] == 1:
-                        winner = "Команда А"
-                    elif m["winner_team"] == 2:
-                        winner = "Команда Б"
-                    else:
-                        winner = "—"
+                    winner = f"{_team_icon(m['winner_team'])} {_team_name(m['winner_team'])}" if m["winner_team"] else "—"
                 else:
                     players = self.storage.get_match_players(m["match_id"])
                     winners = [p["first_name"] for p in players if p["top"]]
@@ -482,7 +488,7 @@ class BotHandlers:
             return self._render_game_step()
         if draft["team_mode"] is None:
             return self._render_mode_step()
-        return self._render_roster_step(chat_id, draft["tournament_id"], bool(draft["team_mode"]))
+        return self._render_roster_step(chat_id, draft["tournament_id"], draft["team_mode"])
 
     def _render_name_step(self) -> tuple[str, InlineKeyboardMarkup]:
         today = datetime.now(self.settings.timezone).strftime("%d.%m")
@@ -503,24 +509,25 @@ class BotHandlers:
     def _render_mode_step(self) -> tuple[str, InlineKeyboardMarkup]:
         kb = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("Соло — каждый сам за себя", callback_data="tn:mode:solo")],
-                [InlineKeyboardButton("Командами", callback_data="tn:mode:team")],
+                [InlineKeyboardButton("Соло — каждый сам за себя", callback_data="tn:mode:0")],
+                [InlineKeyboardButton("2 команды", callback_data="tn:mode:2")],
+                [InlineKeyboardButton("3 команды", callback_data="tn:mode:3")],
+                [InlineKeyboardButton("4 команды", callback_data="tn:mode:4")],
             ]
         )
         return "Как играем?", kb
 
-    def _render_roster_step(self, chat_id: int, tournament_id: int, team_mode: bool) -> tuple[str, InlineKeyboardMarkup]:
+    def _render_roster_step(self, chat_id: int, tournament_id: int, team_count: int) -> tuple[str, InlineKeyboardMarkup]:
         all_players = self.storage.list_players(chat_id)
         selected = {r["user_id"]: r["team"] for r in self.storage.get_draft_players(tournament_id)}
         rows: list[list[InlineKeyboardButton]] = []
         line: list[InlineKeyboardButton] = []
         for p in all_players:
             team = selected.get(p.user_id)
-            if not team_mode:
+            if team_count == 0:
                 label = f"{'✅' if team is not None else '⬜'} {p.first_name}"
             else:
-                icon = {None: "⬜", 1: "🅰", 2: "🅱"}[team]
-                label = f"{icon} {p.first_name}"
+                label = f"{_team_icon(team)} {p.first_name}"
             line.append(InlineKeyboardButton(label, callback_data=f"tn:p:{p.user_id}"))
             if len(line) == 2:
                 rows.append(line)
@@ -534,7 +541,11 @@ class BotHandlers:
                 InlineKeyboardButton("🗑 Отмена", callback_data="tn:cancel"),
             ]
         )
-        text = "Кто играет? (тапни, чтобы выбрать команду)" if team_mode else "Кто играет?"
+        if team_count > 0:
+            cycle = " → ".join([_team_name(t) + " " + _team_icon(t) for t in range(1, team_count + 1)])
+            text = f"Кто играет? Тапай по имени, чтобы распределить по командам:\n⬜ не играет → {cycle} → ⬜"
+        else:
+            text = "Кто играет? Тапай по имени, чтобы включить/выключить."
         if not all_players:
             text += "\n\nПока никого не знаю — напиши что-нибудь в чат или добавь игрока вручную."
         return text, InlineKeyboardMarkup(rows)
@@ -558,7 +569,9 @@ class BotHandlers:
             else:
                 await query.answer()
                 prompt = await query.message.reply_text(
-                    "Напиши название турнира ответом (reply) на это сообщение.", do_quote=False
+                    "Напиши название турнира.",
+                    do_quote=False,
+                    reply_markup=ForceReply(selective=True, input_field_placeholder="Название турнира"),
                 )
                 self.storage.set_pending_input(
                     chat_id=chat_id, user_id=query.from_user.id, kind="tn_name", prompt_message_id=prompt.message_id
@@ -574,7 +587,7 @@ class BotHandlers:
             return
 
         if action == "mode":
-            self.storage.set_draft_mode(tournament_id, parts[2] == "team")
+            self.storage.set_draft_mode(tournament_id, int(parts[2]))
             await query.answer()
             draft = self.storage.get_tournament(tournament_id)
             text, kb = self._render_wizard_step(draft, chat_id)
@@ -583,9 +596,9 @@ class BotHandlers:
 
         if action == "p":
             user_id = int(parts[2])
-            self.storage.toggle_draft_player(tournament_id, user_id, bool(draft["team_mode"]))
+            self.storage.toggle_draft_player(tournament_id, user_id, draft["team_mode"])
             await query.answer()
-            text, kb = self._render_roster_step(chat_id, tournament_id, bool(draft["team_mode"]))
+            text, kb = self._render_roster_step(chat_id, tournament_id, draft["team_mode"])
             await query.edit_message_text(text, reply_markup=kb)
             return
 
@@ -602,13 +615,13 @@ class BotHandlers:
 
     async def _start_tournament(self, query, chat_id: int, draft) -> None:
         tournament_id = draft["tournament_id"]
-        team_mode = bool(draft["team_mode"])
+        team_count = draft["team_mode"]
         players = self.storage.get_draft_players(tournament_id)
-        if team_mode:
-            has_a = any(p["team"] == 1 for p in players)
-            has_b = any(p["team"] == 2 for p in players)
-            if not (has_a and has_b):
-                await query.answer("Нужен хотя бы один игрок в каждой команде.", show_alert=True)
+        if team_count > 0:
+            empty_teams = [t for t in range(1, team_count + 1) if not any(p["team"] == t for p in players)]
+            if empty_teams:
+                names = ", ".join(_team_name(t) for t in empty_teams)
+                await query.answer(f"Нужен хотя бы один игрок в каждой команде. Пусто: {names}.", show_alert=True)
                 return
         elif len(players) < 2:
             await query.answer("Нужно минимум два игрока.", show_alert=True)
@@ -637,8 +650,9 @@ class BotHandlers:
         mode_label = "командами" if tournament["team_mode"] else "соло"
         header = f"🏆 {tournament['name']} · {game_label} {mode_label}\nМатч #{match['match_no']}"
 
+        team_count = tournament["team_mode"]
         rows: list[list[InlineKeyboardButton]] = []
-        if not tournament["team_mode"]:
+        if team_count == 0:
             lines = [f"{p['first_name']:<12} {p['kills']} убийств" + (" · 🏆" if p["top"] else "") for p in players]
             for p in players:
                 rows.append(
@@ -649,14 +663,14 @@ class BotHandlers:
                     ]
                 )
         else:
-            team_a = [p for p in players if p["team"] == 1]
-            team_b = [p for p in players if p["team"] == 2]
             winner = match["winner_team"]
-            lines = ["🅰 команда" + (" 🏆" if winner == 1 else "")]
-            lines += [f"{p['first_name']:<12} {p['kills']} убийств" for p in team_a]
-            lines.append("")
-            lines.append("🅱 команда" + (" 🏆" if winner == 2 else ""))
-            lines += [f"{p['first_name']:<12} {p['kills']} убийств" for p in team_b]
+            lines = []
+            for t in range(1, team_count + 1):
+                team_players = [p for p in players if p["team"] == t]
+                lines.append(f"{_team_icon(t)} {_team_name(t)}" + (" 🏆" if winner == t else ""))
+                lines += [f"{p['first_name']:<12} {p['kills']} убийств" for p in team_players]
+                lines.append("")
+            lines.pop()  # drop trailing blank line
             for p in players:
                 rows.append(
                     [
@@ -664,12 +678,11 @@ class BotHandlers:
                         InlineKeyboardButton("−", callback_data=f"mt:undo:{p['user_id']}"),
                     ]
                 )
-            rows.append(
-                [
-                    InlineKeyboardButton("🏆 Победила А", callback_data="mt:win:1"),
-                    InlineKeyboardButton("🏆 Победила Б", callback_data="mt:win:2"),
-                ]
-            )
+            win_row = [
+                InlineKeyboardButton(f"🏆 {_team_icon(t)} Победа", callback_data=f"mt:win:{t}")
+                for t in range(1, team_count + 1)
+            ]
+            rows.append(win_row)
         rows.append([InlineKeyboardButton("✅ Матч сыгран", callback_data="mt:save")])
         rows.append(
             [
@@ -704,26 +717,23 @@ class BotHandlers:
         rows.append([InlineKeyboardButton("🎲 Рандома / не из наших", callback_data=f"mt:victim:{killer_id}:0")])
         rows.append([InlineKeyboardButton("← Назад", callback_data="mt:back")])
 
-        team_note = ""
-        if tournament["team_mode"]:
-            team_note = " (🅰)" if killer["team"] == 1 else " (🅱)"
+        team_note = f" ({_team_icon(killer['team'])})" if tournament["team_mode"] else ""
         return f"Кого убил {killer['first_name']}{team_note}?", InlineKeyboardMarkup(rows)
 
     def _render_match_roster(self, match_id: int, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
         match = self.storage.get_match(match_id)
         tournament = self.storage.get_tournament(match["tournament_id"])
-        team_mode = bool(tournament["team_mode"])
+        team_count = tournament["team_mode"]
         all_players = self.storage.list_players(chat_id)
         current = {p["user_id"]: p["team"] for p in self.storage.get_match_players(match_id)}
         rows: list[list[InlineKeyboardButton]] = []
         line: list[InlineKeyboardButton] = []
         for p in all_players:
             team = current.get(p.user_id)
-            if not team_mode:
+            if team_count == 0:
                 label = f"{'✅' if team is not None else '⬜'} {p.first_name}"
             else:
-                icon = {None: "⬜", 1: "🅰", 2: "🅱"}[team]
-                label = f"{icon} {p.first_name}"
+                label = f"{_team_icon(team)} {p.first_name}"
             line.append(InlineKeyboardButton(label, callback_data=f"mt:roster:p:{p.user_id}"))
             if len(line) == 2:
                 rows.append(line)
@@ -741,12 +751,11 @@ class BotHandlers:
         kills = self.storage.get_match_kills(match_id)
 
         if tournament["team_mode"]:
-            if match["winner_team"] == 1:
-                winner = "Команда А"
-            elif match["winner_team"] == 2:
-                winner = "Команда Б"
-            else:
-                winner = "нет победителя"
+            winner = (
+                f"{_team_icon(match['winner_team'])} {_team_name(match['winner_team'])}"
+                if match["winner_team"]
+                else "нет победителя"
+            )
             header = f"Матч #{match['match_no']} · 🏆 {winner}"
         else:
             winners = [p["first_name"] for p in players if p["top"]]
@@ -841,7 +850,7 @@ class BotHandlers:
                 return
             if parts[2] == "p":
                 user_id = int(parts[3])
-                self.storage.toggle_match_roster(match_id, user_id, bool(tournament["team_mode"]))
+                self.storage.toggle_match_roster(match_id, user_id, tournament["team_mode"])
                 await query.answer()
                 text, kb = self._render_match_roster(match_id, chat_id)
                 await query.edit_message_text(text, reply_markup=kb)
@@ -1146,8 +1155,9 @@ class BotHandlers:
         origin = parts[1]
         await query.answer()
         prompt = await query.message.reply_text(
-            "Напиши имя ответом (reply) на это сообщение. Можно сразу несколько через пробел.",
+            "Напиши имя нового игрока. Можно сразу несколько через пробел.",
             do_quote=False,
+            reply_markup=ForceReply(selective=True, input_field_placeholder="Имя игрока"),
         )
         self.storage.set_pending_input(
             chat_id=chat_id,
